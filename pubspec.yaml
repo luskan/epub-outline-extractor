@@ -1,0 +1,24 @@
+name: epub_outline_extractor
+description: Pure-Dart EPUB structure extraction (chapters, TOC, structured content) for shared use by quizpilgrim mobile and book_tools.
+version: 1.0.0
+publish_to: 'none'
+
+environment:
+  sdk: ^3.8.1
+
+dependencies:
+  quizpilgrim_book_model:
+    path: ../quizpilgrim_book_model
+  epub_pro:
+    git:
+      url: https://github.com/luskan/epub_pro
+      ref: 307692de8fe093965fb334bbb5ff58fe478f1cae
+  archive: ^4.0.7
+  html: ^0.15.6
+  logging: ^1.2.0
+  meta: ^1.16.0
+  uuid: ^4.5.1
+
+dev_dependencies:
+  test: ^1.25.0
+  lints: ^5.0.0
