@@ -15,6 +15,7 @@ import 'package:quizpilgrim_book_model/quizpilgrim_book_model.dart';
 
 import 'epub_data.dart';
 import 'epub_extraction_result.dart';
+import 'epub_guards.dart';
 import 'epub_structured_content_builder.dart';
 import 'html_text_extractor.dart';
 import 'text_cleaner.dart';
@@ -25,11 +26,13 @@ const String _loggerName = 'EpubExtractor';
 class EpubExtractor {
   final bool fixLineBreaks;
   final bool extractSections;
+  final EpubGuardLimits guardLimits;
   final Logger _logger;
 
   EpubExtractor({
     this.fixLineBreaks = true,
     this.extractSections = true,
+    this.guardLimits = const EpubGuardLimits(),
     Logger? logger,
   }) : _logger = logger ?? Logger(_loggerName);
 
@@ -51,6 +54,8 @@ class EpubExtractor {
     // logger threshold (legacy `EpubToJsonConverter` defaulted
     // `verbose: false`, making `_log()` a no-op in release builds).
     _logger.fine('Converting EPUB: ${filename ?? "unknown"}');
+
+    enforceArchiveGuards(epubBytes, guardLimits);
 
     onProgress?.call(0, 100, 'Parsing EPUB');
     final epubBook = await EpubReader.readBook(epubBytes);
