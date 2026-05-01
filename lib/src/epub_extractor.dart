@@ -2,10 +2,10 @@
 ///
 /// Migrated from `quizpilgrim-app/.../core/converters/epub_converter.dart` in
 /// EPUB-plan Phase 2. Replaces mobile-private `AppLogger` with injected
-/// `package:logging` `Logger`. Returns a neutral [BookSection] tree (rooted
-/// at the book) plus minimal OPF metadata; the mobile-internal adapter
-/// (`book_import/epub_processor.dart`) re-projects this onto
-/// `ConversionResult` for the existing import pipeline.
+/// `package:logging` `Logger`. Returns a neutral [BookSection] tree (the
+/// TOC view) plus per-spine-file chapter content and OPF metadata; see
+/// `EpubExtractionResult` for why those last two pieces are bundled
+/// separately rather than folded into the [BookSection] tree.
 library;
 
 import 'dart:typed_data';
@@ -33,79 +33,64 @@ class EpubExtractor {
     Logger? logger,
   }) : _logger = logger ?? Logger(_loggerName);
 
-  /// Convert EPUB bytes into a [BookSection] tree + book metadata.
+  /// Convert EPUB bytes into an [EpubExtractionResult] (TOC tree +
+  /// per-spine chapter content + OPF metadata).
   ///
   /// [epubBytes] — Raw EPUB bytes.
   /// [filename] — Original filename, surfaced in error messages and useful
   ///   when the EPUB OPF lacks a title.
   /// [onProgress] — Optional progress callback. Stage strings are
   ///   `'Parsing EPUB'`, `'Extracting chapters'`, `'Extracting sections'`.
-  ///
-  /// The returned [EpubExtractionResult.root] is the book itself. Its
-  /// subsections are chapters in spine order; each chapter's subsections
-  /// hierarchically mirror the EPUB TOC tree (when `extractSections` is
-  /// `true` and the book has a navigable TOC).
   Future<EpubExtractionResult> extract(
     Uint8List epubBytes, {
     String? filename,
     void Function(int current, int total, String stage)? onProgress,
   }) async {
-    _logger.info('Converting EPUB: ${filename ?? "unknown"}');
+    // Logs are emitted at FINE level so the legacy silent-by-default
+    // behavior is preserved when consumers don't explicitly raise the
+    // logger threshold (legacy `EpubToJsonConverter` defaulted
+    // `verbose: false`, making `_log()` a no-op in release builds).
+    _logger.fine('Converting EPUB: ${filename ?? "unknown"}');
 
-    // Parse EPUB.
     onProgress?.call(0, 100, 'Parsing EPUB');
     final epubBook = await EpubReader.readBook(epubBytes);
     onProgress?.call(100, 100, 'Parsing EPUB');
-    _logger.info('Parsed EPUB: "${epubBook.title}"');
+    _logger.fine('Parsed EPUB: "${epubBook.title}"');
 
-    // Internal data: spine order, TOC tree, OPF metadata.
     final epubData = _buildEpubDataFromEpubPro(epubBook);
 
-    // Step 1: per-spine-file chapter texts.
     final chapters = _extractChapters(
       epubBook,
       onProgress: (current, total) =>
           onProgress?.call(current, total, 'Extracting chapters'),
     );
-    _logger.info('Extracted ${chapters.length} chapters');
+    _logger.fine('Extracted ${chapters.length} chapters');
 
-    // Step 2: per-TOC-entry section texts (hierarchical).
-    final sectionsByChapter = <String, List<BookSection>>{};
-    if (extractSections && epubData.tocEntries.isNotEmpty) {
-      _buildSectionsFromTocTree(
-        epubBook,
-        epubData,
-        chapters,
-        sectionsByChapter,
-        onProgress: (current, total) =>
-            onProgress?.call(current, total, 'Extracting sections'),
-      );
-    }
-
-    // Step 3: assemble chapter [BookSection]s and the root.
-    final chapterSections = <BookSection>[];
-    for (var i = 0; i < chapters.length; i++) {
-      final chapter = chapters[i];
-      final chapterSubsections =
-          sectionsByChapter[chapter.name] ?? const <BookSection>[];
-      chapterSections.add(
-        BookSection(
-          title: chapter.title,
-          location: EpubChapterLocation(
-            spineIndex: i,
-            href: chapter.name,
-          ),
-          content: [chapter.text],
-          subsections: chapterSubsections,
-        ),
-      );
-    }
+    final tocSections = (extractSections && epubData.tocEntries.isNotEmpty)
+        ? _buildTocSections(
+            epubBook,
+            epubData,
+            chapters,
+            onProgress: (current, total) =>
+                onProgress?.call(current, total, 'Extracting sections'),
+          )
+        : <BookSection>[];
 
     final root = BookSection(
       title: epubBook.title ?? '',
       location: const EpubChapterLocation(spineIndex: 0),
-      subsections: chapterSections,
+      subsections: tocSections,
     );
+
+    final chapterContents = <EpubChapterContent>[
+      for (var i = 0; i < chapters.length; i++)
+        EpubChapterContent(
+          spineIndex: i,
+          filename: chapters[i].name,
+          title: chapters[i].title,
+          text: chapters[i].text,
+        ),
+    ];
 
     final metadata = EpubBookMetadata(
       title: epubBook.title,
@@ -113,12 +98,16 @@ class EpubExtractor {
       authors: List<String?>.unmodifiable(epubBook.authors),
     );
 
-    _logger.info(
+    _logger.fine(
       'EPUB extraction complete — chapters=${chapters.length}, '
-      'sections=${sectionsByChapter.values.fold<int>(0, (s, l) => s + _countTree(l))}',
+      'sections=${_countTree(tocSections)}',
     );
 
-    return EpubExtractionResult(root: root, metadata: metadata);
+    return EpubExtractionResult(
+      root: root,
+      chapters: chapterContents,
+      metadata: metadata,
+    );
   }
 
   /// Build internal EpubData from epub_pro structures.
@@ -180,7 +169,7 @@ class EpubExtractor {
           : <TocEntry>[];
 
       // If parent has a generic title and first child has numbered version,
-      // use the child's title for parent (e.g., "Data Structures" -> "I. Data Structures")
+      // use the child's title for parent (e.g., "Data Structures" → "I. Data Structures")
       String title = chapter.title?.trim() ?? 'Untitled';
       if (chapter.subChapters.isNotEmpty) {
         final firstChildTitle = chapter.subChapters.first.title?.trim();
@@ -226,35 +215,40 @@ class EpubExtractor {
       processed++;
       onProgress?.call(processed, totalChapters);
 
+      // Decide whether the current node contributes a [ChapterData].
+      // Recursion into subChapters runs unconditionally afterward — a
+      // skipped parent (e.g., a part-divider navPoint with no content,
+      // duplicate file, or empty body) must not silently drop its
+      // descendants, otherwise the TOC pass later sees `chapterIndex ==
+      // -1` for those descendants and fails to materialise them as
+      // depth-1 BookSections (Round 1/2 review feedback).
       final fileName = chapter.contentFileName;
-      if (fileName == null || seenFiles.contains(fileName)) return;
-      if (!_isHtmlFile(fileName)) return;
+      final hasFile = fileName != null && !seenFiles.contains(fileName);
+      final isHtml = hasFile && _isHtmlFile(fileName);
+      final htmlContent = isHtml ? chapter.htmlContent : null;
+      final hasContent = htmlContent != null && htmlContent.isNotEmpty;
 
-      final htmlContent = chapter.htmlContent;
-      if (htmlContent == null || htmlContent.isEmpty) return;
-
-      final text = extractTextFromHtml(htmlContent);
-      if (text.trim().isEmpty) return;
-
-      seenFiles.add(fileName);
-
-      final cleanedText = fixLineBreaks
-          ? TextCleaner.cleanText(text, fixLineBreaks: true)
-          : text;
-
-      final title =
-          chapter.title ?? extractTitleFromHtml(htmlContent, fileName);
-
-      chapters.add(
-        ChapterData(
-          chapter: chapters.length + 1,
-          name: fileName,
-          title: title,
-          text: cleanedText,
-          confidence: 1.0,
-          correctedText: cleanedText,
-        ),
-      );
+      if (hasFile && isHtml && hasContent) {
+        final text = extractTextFromHtml(htmlContent);
+        if (text.trim().isNotEmpty) {
+          seenFiles.add(fileName);
+          final cleanedText = fixLineBreaks
+              ? TextCleaner.cleanText(text, fixLineBreaks: true)
+              : text;
+          final title =
+              chapter.title ?? extractTitleFromHtml(htmlContent, fileName);
+          chapters.add(
+            ChapterData(
+              chapter: chapters.length + 1,
+              name: fileName,
+              title: title,
+              text: cleanedText,
+              confidence: 1.0,
+              correctedText: cleanedText,
+            ),
+          );
+        }
+      }
 
       for (final sub in chapter.subChapters) {
         processChapter(sub);
@@ -268,19 +262,24 @@ class EpubExtractor {
     return chapters;
   }
 
-  /// Build hierarchical [BookSection] trees per chapter from the TOC tree.
+  /// Build the hierarchical TOC tree as `List<BookSection>`.
   ///
-  /// Section text is extracted between fragment anchors (or full chapter
-  /// text when no fragments are present). Output is grouped by chapter
-  /// filename, mirroring the original TOC hierarchy under each chapter.
-  void _buildSectionsFromTocTree(
+  /// Mirrors the original [TocEntry] tree up to depth 1 (legacy
+  /// `_flattenToc(maxDepth: 1)` policy): depth-0 entries' [BookSection]s
+  /// have their depth-1 children nested as `subsections`. Depth-2+ entries
+  /// are not emitted; their text is merged into the depth-1 parent's
+  /// section text by `extractSectionText`'s heading-stop logic.
+  ///
+  /// Each section's [BookSection.location] (an [EpubChapterLocation])
+  /// reflects the entry's own href — its `spineIndex` may differ from its
+  /// parent's if the depth-1 entry's href points to a different chapter
+  /// file (an unusual but legal EPUB structure).
+  List<BookSection> _buildTocSections(
     EpubBook epubBook,
     EpubData epubData,
-    List<ChapterData> chapters,
-    Map<String, List<BookSection>> sectionsByChapter, {
+    List<ChapterData> chapters, {
     void Function(int current, int total)? onProgress,
   }) {
-    // Build HTML content map for fragment-based extraction.
     final htmlContentMap = <String, String>{};
     void collectHtml(EpubChapter chapter) {
       if (chapter.contentFileName != null && chapter.htmlContent != null) {
@@ -295,32 +294,57 @@ class EpubExtractor {
       collectHtml(chapter);
     }
 
-    // Flatten TOC at maxDepth=1 (matches legacy mobile behavior — depth-2+
-    // entries get merged into their parent's section text via heading-stop
-    // detection during extractSectionText).
+    // Flatten the TOC tree at maxDepth=1 (legacy behavior). Depth-2+
+    // entries are silently dropped here; their text is captured by the
+    // surrounding depth-1 section's extracted text via heading-stop logic.
+    // The flat list preserves DFS pre-order so we can compute next-fragment
+    // bounds locally.
     final tocFlat = _flattenToc(epubData.tocEntries);
     if (tocFlat.isNotEmpty) {
       onProgress?.call(0, tocFlat.length);
     }
 
-    // Process each TOC item, grouping under its chapter.
+    // Build a flat parallel list of BookSections in tocFlat order, then
+    // reconstruct the depth-0/depth-1 hierarchy from `parentTitle`. We
+    // need the flat ordering for next-fragment bound computation, but we
+    // emit a hierarchical tree so the adapter can recover legacy
+    // `parentTitle` semantics (depth-0 → null, depth-1 → parent's title).
+    //
+    // Virtual placeholders: depth-0 entries with no href (or whose href
+    // points to a missing chapter) still get a [BookSection] with a
+    // sentinel location (`spineIndex: -1, href: null`) and empty
+    // [content]. The mobile adapter recognises this sentinel and skips
+    // emitting a SectionData for the placeholder itself, but still emits
+    // its depth-1 children with `parentTitle = placeholder.title` —
+    // matching legacy `_extractSectionsFromToc` behavior where the
+    // skipped parent's children kept being processed independently.
+    final flatBookSections = <BookSection?>[];
+
+    BookSection virtualPlaceholder(String title) => BookSection(
+      title: title,
+      location: const EpubChapterLocation(spineIndex: -1),
+    );
+
     for (var i = 0; i < tocFlat.length; i++) {
       final tocItem = tocFlat[i];
       onProgress?.call(i + 1, tocFlat.length);
 
       if (tocItem.href == null) {
         _logger.fine('SKIPPED: "${tocItem.title}" - no href');
+        flatBookSections
+            .add(tocItem.depth == 0 ? virtualPlaceholder(tocItem.title) : null);
         continue;
       }
 
       final (file, fragment) = TextParsingUtils.parseHref(tocItem.href!);
 
-      // Find corresponding chapter index.
       final chapterIndex = chapters.indexWhere((ch) => ch.name == file);
       if (chapterIndex == -1) {
         _logger.fine(
           'SKIPPED: "${tocItem.title}" - chapter not found: $file',
         );
+        flatBookSections
+            .add(tocItem.depth == 0 ? virtualPlaceholder(tocItem.title) : null);
         continue;
       }
 
@@ -347,6 +371,7 @@ class EpubExtractor {
           _logger.fine(
             'SKIPPED: "${tocItem.title}" - HTML content not found for $file',
           );
+          flatBookSections.add(null);
           continue;
         }
 
@@ -369,7 +394,8 @@ class EpubExtractor {
         sectionText = chapters[chapterIndex].text;
       }
 
-      // Generate structured content annotations.
+      // Generate structured content annotations (full-chapter HTML →
+      // section-text mapping).
       String? structuredJson;
       final sectionHtml = htmlContentMap[file];
       if (sectionText.isNotEmpty && sectionHtml != null) {
@@ -383,22 +409,49 @@ class EpubExtractor {
         }
       }
 
-      final section = BookSection(
-        title: tocItem.title,
-        location: EpubChapterLocation(
-          spineIndex: chapterIndex,
-          href: file,
-          anchor: fragment,
+      flatBookSections.add(
+        BookSection(
+          title: tocItem.title,
+          location: EpubChapterLocation(
+            spineIndex: chapterIndex,
+            href: file,
+            anchor: fragment,
+          ),
+          content: [sectionText],
+          structuredContentJson: structuredJson,
         ),
-        content: [sectionText],
-        structuredContentJson: structuredJson,
       );
-
-      sectionsByChapter.putIfAbsent(file, () => <BookSection>[]).add(section);
     }
+
+    // Reconstruct depth-0/depth-1 hierarchy from tocFlat. tocFlat is
+    // pre-order DFS through depth ≤ 1, so depth-1 entries always follow
+    // their parent depth-0 entry contiguously.
+    final result = <BookSection>[];
+    for (var i = 0; i < tocFlat.length; i++) {
+      if (tocFlat[i].depth != 0) continue;
+      final parentSection = flatBookSections[i];
+      if (parentSection == null) continue;
+
+      // Collect this depth-0 entry's depth-1 children: scan forward until
+      // the next depth-0 entry.
+      final children = <BookSection>[];
+      for (var j = i + 1; j < tocFlat.length; j++) {
+        if (tocFlat[j].depth == 0) break;
+        final child = flatBookSections[j];
+        if (child != null) children.add(child);
+      }
+
+      if (children.isEmpty) {
+        result.add(parentSection);
+      } else {
+        result.add(parentSection.copyWith(subsections: children));
+      }
+    }
+
+    return result;
   }
 
-  /// Flatten the TOC tree, keeping entries up to [maxDepth].
+  /// Flatten the TOC tree at [maxDepth]; preserves pre-order DFS order.
   List<TocItemFlat> _flattenToc(List<TocEntry> tocEntries, {int maxDepth = 1}) {
     final flat = <TocItemFlat>[];
 

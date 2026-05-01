@@ -3,7 +3,6 @@ import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:epub_outline_extractor/epub_outline_extractor.dart';
-import 'package:logging/logging.dart';
 import 'package:quizpilgrim_book_model/quizpilgrim_book_model.dart';
 import 'package:test/test.dart';
 
@@ -17,28 +16,32 @@ void main() {
 
       expect(result.metadata.title, 'Test EPUB');
       expect(result.root.title, 'Test EPUB');
-      expect(result.root.subsections, hasLength(1));
 
-      final chapter = result.root.subsections.first;
-      expect(chapter.title, 'Chapter 1: Introduction');
-      expect(chapter.location, isA<EpubChapterLocation>());
-      final loc = chapter.location as EpubChapterLocation;
+      // Chapters list (page-level view) — one per spine HTML file.
+      expect(result.chapters, hasLength(1));
+      expect(result.chapters.first.spineIndex, 0);
+      expect(result.chapters.first.filename, 'chapter01.xhtml');
+      expect(result.chapters.first.text, contains('introduction'));
+
+      // root.subsections (TOC view) — one depth-0 entry for the only TOC item.
+      expect(result.root.subsections, hasLength(1));
+      final tocSection = result.root.subsections.first;
+      expect(tocSection.title, 'Chapter 1: Introduction');
+      expect(tocSection.location, isA<EpubChapterLocation>());
+      final loc = tocSection.location as EpubChapterLocation;
       expect(loc.spineIndex, 0);
       expect(loc.href, 'chapter01.xhtml');
-      expect(chapter.content.first, contains('Chapter 1: Introduction'));
+      expect(tocSection.subsections, isEmpty);
     });
 
-    test('extractSections=false skips TOC pass', () async {
+    test('extractSections=false skips TOC pass but keeps chapters', () async {
       final epubBytes = _createMinimalEpub();
       final extractor = EpubExtractor(extractSections: false);
 
       final result = await extractor.extract(epubBytes);
 
-      // Chapters still emitted; TOC sub-sections skipped.
-      expect(result.root.subsections, isNotEmpty);
-      for (final ch in result.root.subsections) {
-        expect(ch.subsections, isEmpty);
-      }
+      expect(result.chapters, isNotEmpty);
+      expect(result.root.subsections, isEmpty);
     });
 
     test('uses provided logger instance', () async {
@@ -50,8 +53,9 @@ void main() {
       final extractor = EpubExtractor(logger: logger);
       await extractor.extract(_createMinimalEpub(), filename: 'test.epub');
 
-      // At least one info log went to the injected logger; nothing should
-      // have been written to the global root logger from this extraction.
+      // At least one fine-level log went to the injected logger; nothing
+      // should have been written to the global root logger from this
+      // extraction.
       expect(logRecords, isNotEmpty);
       expect(
         logRecords.any((m) => m.startsWith('Converting EPUB:')),
@@ -69,6 +73,7 @@ void main() {
 
       expect(stages, containsAll(<String>['Parsing EPUB']));
     });
+
   });
 }
 
