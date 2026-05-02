@@ -695,6 +695,115 @@ class EpubImageExtractor {
   }
 }
 
+/// Append image blocks for [figures] to [section]'s structured content.
+///
+/// Returns a new [BookSection] with the same identity but updated
+/// `structuredContentJson`. If the section had no structured content,
+/// one is synthesized with only the image blocks (paragraph rendering
+/// of the original `content[0]` is unaffected — the renderer falls
+/// back to plain text in regions the structured content does not
+/// annotate, and image blocks at `start == end == plainText.length`
+/// render after all the section's text).
+///
+/// If [figures] is empty, returns [section] unchanged. If the section
+/// has no plain text (`content` empty), figures are skipped (we cannot
+/// compute a stable `baseTextHash` without text).
+BookSection embedImagePathsInSection(
+  BookSection section,
+  List<ExtractedFigure> figures,
+) {
+  if (figures.isEmpty) return section;
+  if (section.content.isEmpty) return section;
+
+  final plainText = section.content.first;
+  final endOffset = plainText.length;
+
+  final newImageBlocks = <ContentBlock>[
+    for (final f in figures)
+      ContentBlock(
+        type: ContentBlockType.image,
+        start: endOffset,
+        end: endOffset,
+        imagePath: f.figure.path,
+        caption: null,
+      ),
+  ];
+
+  final existing = StructuredContent.tryParse(section.structuredContentJson);
+  final List<ContentBlock> mergedBlocks;
+  final String baseHash;
+  if (existing != null && existing.isValidFor(plainText)) {
+    mergedBlocks = <ContentBlock>[
+      ...existing.annotations,
+      ...newImageBlocks,
+    ];
+    baseHash = existing.baseTextHash;
+  } else {
+    // No usable existing structured content (or it doesn't match the
+    // text the figures were extracted from). Build a fresh
+    // StructuredContent with only the image blocks.
+    mergedBlocks = newImageBlocks;
+    baseHash = StructuredContent.computeHash(plainText);
+  }
+
+  final merged = StructuredContent(
+    schemaVersion: 1,
+    baseTextHash: baseHash,
+    annotations: mergedBlocks,
+  );
+
+  return section.copyWith(
+    structuredContentJson: merged.toJsonString(),
+  );
+}
+
+/// Walk [root] and embed image paths into every section that has
+/// figures attributed to it in [figuresBySection]. Returns a new tree.
+///
+/// `figuresBySection` is typically built by grouping the
+/// [EpubImageExtractionResult.figures] list by `figure.ownerSection`.
+BookSection embedImagePathsInTree(
+  BookSection root,
+  Map<BookSection, List<ExtractedFigure>> figuresBySection,
+) {
+  final figures = figuresBySection[root] ?? const <ExtractedFigure>[];
+  final updatedRoot = embedImagePathsInSection(root, figures);
+
+  if (updatedRoot.subsections.isEmpty) return updatedRoot;
+
+  final updatedChildren = <BookSection>[
+    for (final child in updatedRoot.subsections)
+      embedImagePathsInTree(child, figuresBySection),
+  ];
+
+  // Only allocate a copy if any child actually changed identity.
+  var changed = false;
+  for (var i = 0; i < updatedChildren.length; i++) {
+    if (!identical(updatedChildren[i], updatedRoot.subsections[i])) {
+      changed = true;
+      break;
+    }
+  }
+
+  return changed
+      ? updatedRoot.copyWith(subsections: updatedChildren)
+      : updatedRoot;
+}
+
+/// Group an extraction result's figures by owner section. Sections
+/// with no figures are not included.
+Map<BookSection, List<ExtractedFigure>> groupFiguresBySection(
+  EpubImageExtractionResult result,
+) {
+  final out = <BookSection, List<ExtractedFigure>>{};
+  for (final f in result.figures) {
+    final owner = f.ownerSection;
+    if (owner == null) continue;
+    out.putIfAbsent(owner, () => <ExtractedFigure>[]).add(f);
+  }
+  return out;
+}
+
 @immutable
 class _ImageRef {
   final dom.Element element;

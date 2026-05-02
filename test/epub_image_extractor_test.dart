@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:archive/archive.dart';
 import 'package:crypto/crypto.dart';
 import 'package:epub_outline_extractor/epub_outline_extractor.dart';
+import 'package:quizpilgrim_book_model/quizpilgrim_book_model.dart';
 import 'package:test/test.dart';
 
 void main() {
@@ -405,6 +406,175 @@ void main() {
       );
 
       expect(result.figures, isEmpty);
+    });
+
+    test('embedImagePathsInSection appends image blocks at end of plainText',
+        () async {
+      const plain = 'Once upon a time there was a kingdom.';
+      final section = BookSection(
+        title: 'Ch 1',
+        location: const EpubChapterLocation(spineIndex: 0, href: 'c.xhtml'),
+        content: const [plain],
+      );
+      final figs = <ExtractedFigure>[
+        ExtractedFigure(
+          figure: const Figure(
+            path: 'figs/0.png',
+            anchor: 'c.xhtml:0',
+            source: 'epub_img_tag',
+            sourceHref: 'c.xhtml',
+            domIndex: 0,
+          ),
+          absolutePath: '/tmp/figs/0.png',
+          ownerSection: section,
+          sectionLocalIndex: 0,
+        ),
+        ExtractedFigure(
+          figure: const Figure(
+            path: 'figs/1.png',
+            anchor: 'c.xhtml:1',
+            source: 'epub_img_tag',
+            sourceHref: 'c.xhtml',
+            domIndex: 1,
+          ),
+          absolutePath: '/tmp/figs/1.png',
+          ownerSection: section,
+          sectionLocalIndex: 1,
+        ),
+      ];
+      final updated = embedImagePathsInSection(section, figs);
+      final sc = StructuredContent.tryParse(updated.structuredContentJson);
+      expect(sc, isNotNull);
+      expect(sc!.annotations.length, 2);
+      expect(sc.annotations[0].type, ContentBlockType.image);
+      expect(sc.annotations[0].imagePath, 'figs/0.png');
+      expect(sc.annotations[0].start, plain.length);
+      expect(sc.annotations[0].end, plain.length);
+      expect(sc.annotations[1].imagePath, 'figs/1.png');
+      // baseTextHash matches the section's plainText.
+      expect(sc.isValidFor(plain), isTrue);
+    });
+
+    test('embedImagePathsInSection preserves existing structured content',
+        () async {
+      const plain = 'Hello world.';
+      final existing = StructuredContent(
+        schemaVersion: 1,
+        baseTextHash: StructuredContent.computeHash(plain),
+        annotations: const [
+          ContentBlock(
+            type: ContentBlockType.heading,
+            start: 0,
+            end: 5,
+            level: 1,
+          ),
+        ],
+      );
+      final section = BookSection(
+        title: 'Ch',
+        location: const EpubChapterLocation(spineIndex: 0, href: 'c.xhtml'),
+        content: const [plain],
+        structuredContentJson: existing.toJsonString(),
+      );
+      final fig = ExtractedFigure(
+        figure: const Figure(
+          path: 'figs/0.png',
+          anchor: 'c.xhtml:0',
+          source: 'epub_img_tag',
+          sourceHref: 'c.xhtml',
+          domIndex: 0,
+        ),
+        absolutePath: '/tmp/0.png',
+        ownerSection: section,
+        sectionLocalIndex: 0,
+      );
+      final updated = embedImagePathsInSection(section, [fig]);
+      final sc = StructuredContent.tryParse(updated.structuredContentJson)!;
+      expect(sc.annotations.length, 2);
+      expect(sc.annotations[0].type, ContentBlockType.heading);
+      expect(sc.annotations[1].type, ContentBlockType.image);
+      expect(sc.annotations[1].imagePath, 'figs/0.png');
+    });
+
+    test('embedImagePathsInTree threads figures into owner sections', () async {
+      final root = BookSection(
+        title: 'Book',
+        location: const EpubChapterLocation(spineIndex: 0),
+      );
+      final ch1 = BookSection(
+        title: 'Ch 1',
+        location: const EpubChapterLocation(spineIndex: 0, href: 'a.xhtml'),
+        content: const ['Chapter one text.'],
+      );
+      final ch2 = BookSection(
+        title: 'Ch 2',
+        location: const EpubChapterLocation(spineIndex: 1, href: 'b.xhtml'),
+        content: const ['Chapter two text.'],
+      );
+      final tree = root.copyWith(subsections: [ch1, ch2]);
+
+      final figs = <BookSection, List<ExtractedFigure>>{
+        ch1: [
+          ExtractedFigure(
+            figure: const Figure(
+              path: 'figs/a/0.png',
+              anchor: 'a.xhtml:0',
+              source: 'epub_img_tag',
+              sourceHref: 'a.xhtml',
+              domIndex: 0,
+            ),
+            absolutePath: '/tmp/a/0.png',
+            ownerSection: ch1,
+            sectionLocalIndex: 0,
+          ),
+        ],
+      };
+      final updated = embedImagePathsInTree(tree, figs);
+      // ch1 should have image block; ch2 should be unchanged.
+      final updatedCh1 = updated.subsections.firstWhere((s) => s.title == 'Ch 1');
+      final updatedCh2 = updated.subsections.firstWhere((s) => s.title == 'Ch 2');
+      expect(updatedCh1.structuredContentJson, isNotNull);
+      expect(updatedCh2.structuredContentJson, isNull);
+      final sc = StructuredContent.tryParse(updatedCh1.structuredContentJson)!;
+      expect(sc.annotations, hasLength(1));
+      expect(sc.annotations.first.imagePath, 'figs/a/0.png');
+    });
+
+    test('groupFiguresBySection ignores figures with null owner', () async {
+      final s = BookSection(
+        title: 'X',
+        location: const EpubChapterLocation(spineIndex: 0, href: 'x.xhtml'),
+      );
+      final result = EpubImageExtractionResult(figures: [
+        ExtractedFigure(
+          figure: const Figure(
+            path: 'a.png',
+            anchor: 'x.xhtml:0',
+            source: 'epub_img_tag',
+            sourceHref: 'x.xhtml',
+            domIndex: 0,
+          ),
+          absolutePath: '/tmp/a.png',
+          ownerSection: s,
+          sectionLocalIndex: 0,
+        ),
+        ExtractedFigure(
+          figure: const Figure(
+            path: 'b.png',
+            anchor: 'x.xhtml:1',
+            source: 'epub_img_tag',
+            sourceHref: 'x.xhtml',
+            domIndex: 1,
+          ),
+          absolutePath: '/tmp/b.png',
+          ownerSection: null,
+          sectionLocalIndex: 0,
+        ),
+      ]);
+      final grouped = groupFiguresBySection(result);
+      expect(grouped, hasLength(1));
+      expect(grouped[s], hasLength(1));
+      expect(grouped[s]!.first.figure.path, 'a.png');
     });
 
     test('archive guards still fire (oversize file rejected)', () async {
