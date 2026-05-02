@@ -14,9 +14,11 @@ dependencies:
       url: https://github.com/luskan/epub_pro
       ref: 307692de8fe093965fb334bbb5ff58fe478f1cae
   archive: ^4.0.7
+  crypto: ^3.0.5
   html: ^0.15.6
   logging: ^1.2.0
   meta: ^1.16.0
+  path: ^1.9.0
   uuid: ^4.5.1
 
 dev_dependencies:
