@@ -133,10 +133,21 @@ class EpubExtractionResult {
   /// Book-level OPF metadata (title/author/authors).
   final EpubBookMetadata metadata;
 
+  /// OPF-relative chapter href → raw HTML/XHTML content, for consumers
+  /// that need to render the original markup (e.g. `book_tools`'s
+  /// `EpubChapterPreviewPanel`). The map is unmodifiable; absent if the
+  /// extractor was constructed with HTML retention disabled.
+  ///
+  /// Pre-Phase-6 builds returned `const {}` here; populating it adds
+  /// memory proportional to chapter HTML size — acceptable for the dev
+  /// tool, used by the GUI preview pane only.
+  final Map<String, String> rawHtmlByHref;
+
   const EpubExtractionResult({
     required this.root,
     required this.chapters,
     required this.metadata,
+    this.rawHtmlByHref = const {},
   });
 }
 

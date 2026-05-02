@@ -108,10 +108,21 @@ class EpubExtractor {
       'sections=${_countTree(tocSections)}',
     );
 
+    // Capture raw HTML/XHTML by OPF-relative href so downstream
+    // consumers (e.g. book_tools' chapter preview panel) can render the
+    // original markup without re-parsing the archive. Empty when
+    // `epub_pro` returns no html-classified files.
+    final htmlMap = <String, String>{};
+    for (final entry in (epubBook.content?.html ?? const {}).entries) {
+      final raw = entry.value.content;
+      if (raw != null) htmlMap[entry.key] = raw;
+    }
+
     return EpubExtractionResult(
       root: root,
       chapters: chapterContents,
       metadata: metadata,
+      rawHtmlByHref: Map.unmodifiable(htmlMap),
     );
   }
 
