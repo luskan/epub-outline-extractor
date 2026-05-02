@@ -577,6 +577,105 @@ void main() {
       expect(grouped[s]!.first.figure.path, 'a.png');
     });
 
+    test('Windows-style backslash zip-slip is rejected', () async {
+      final epub = _buildEpub(
+        chapters: {
+          'OEBPS/chap01.xhtml':
+              '<html><body><img src="..\\..\\Windows\\System32\\config.png"/></body></html>',
+        },
+        images: {},
+        manifestImages: {},
+      );
+      final tree = await EpubExtractor().extract(epub);
+      final result = await EpubImageExtractor().extract(
+        epubBytes: epub,
+        sectionTree: tree.root,
+        targetDir: tempRoot,
+        namingScheme: (s, idx, ext) => 'fig_$idx.$ext',
+      );
+      expect(result.figures, isEmpty);
+    });
+
+    test('Windows drive-letter src ("C:\\foo") is rejected', () async {
+      final epub = _buildEpub(
+        chapters: {
+          'OEBPS/chap01.xhtml':
+              r'<html><body><img src="C:\Windows\evil.png"/></body></html>',
+        },
+        images: {},
+        manifestImages: {},
+      );
+      final tree = await EpubExtractor().extract(epub);
+      final result = await EpubImageExtractor().extract(
+        epubBytes: epub,
+        sectionTree: tree.root,
+        targetDir: tempRoot,
+        namingScheme: (s, idx, ext) => 'fig_$idx.$ext',
+      );
+      expect(result.figures, isEmpty);
+    });
+
+    test('SVG with XML-numeric-encoded http scheme is rejected (SSRF bypass)',
+        () async {
+      // `http&#58;//evil/x.png` — the `:` is an XML numeric reference.
+      // A naive scheme check sees no colon and lets it through; we
+      // decode numeric refs in the scheme position before rejecting.
+      const svg = '''<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     xmlns:xlink="http://www.w3.org/1999/xlink">
+  <image xlink:href="http&#58;//evil.example/leak.png"
+         width="100" height="100"/>
+</svg>''';
+      final svgBytes = Uint8List.fromList(utf8.encode(svg));
+      final epub = _buildEpub(
+        chapters: {
+          'OEBPS/chap01.xhtml':
+              '<html><body><img src="images/x.svg"/></body></html>',
+        },
+        images: {'OEBPS/images/x.svg': svgBytes},
+        manifestImages: {'images/x.svg': 'image/svg+xml'},
+      );
+      final tree = await EpubExtractor().extract(epub);
+      final result = await EpubImageExtractor().extract(
+        epubBytes: epub,
+        sectionTree: tree.root,
+        targetDir: tempRoot,
+        namingScheme: (s, idx, ext) => 'fig_$idx.$ext',
+      );
+      expect(result.figures, isEmpty);
+    });
+
+    test('huge data: URI is rejected before base64.decode runs', () async {
+      // Encoded length > 2× cap → pre-decode rejection. The payload
+      // is short and incompressible-ish (a counted unique-string
+      // sequence) so it doesn't trip the archive's compression-ratio
+      // guard, just the data-URI cap.
+      final buf = StringBuffer();
+      for (var i = 0; i < 5000; i++) {
+        buf.write('XYZ${i.toRadixString(36).padLeft(4, '0')}');
+      }
+      final encodedPayload = buf.toString();
+      final dataUri = 'data:image/png;base64,$encodedPayload';
+      final epub = _buildEpub(
+        chapters: {
+          'OEBPS/chap01.xhtml': '<html><body><img src="$dataUri"/></body></html>',
+        },
+        images: {},
+        manifestImages: {},
+      );
+      final tree = await EpubExtractor().extract(epub);
+      final result = await EpubImageExtractor(
+        // 1 KB cap; encoded ~35 KB; over the 2× pre-decode bound.
+        guardLimits: const EpubGuardLimits(maxDataUriBytes: 1024),
+      ).extract(
+        epubBytes: epub,
+        sectionTree: tree.root,
+        targetDir: tempRoot,
+        namingScheme: (s, idx, ext) => 'fig_$idx.$ext',
+      );
+      expect(result.figures, isEmpty);
+    });
+
     test('archive guards still fire (oversize file rejected)', () async {
       final epub = _buildEpub(
         chapters: {

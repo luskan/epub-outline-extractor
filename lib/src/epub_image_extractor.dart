@@ -19,6 +19,7 @@
 ///     `enforceArchiveGuards` at entry, before `epub_pro` decoding.
 library;
 
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -145,7 +146,18 @@ class EpubImageExtractor {
     if (!await targetDir.exists()) {
       await targetDir.create(recursive: true);
     }
-    final targetAbs = targetDir.absolute.path;
+    // Resolve symlinks once at entry. The lexical `p.isWithin` check
+    // we run on every file path below cannot detect a symlinked
+    // `targetDir` whose realpath escapes the lexical containment
+    // assumption (e.g. `/tmp/figs → /var/...`). Resolving up front
+    // means subsequent path comparisons are against the real
+    // filesystem location, not the symlink view.
+    String targetAbs;
+    try {
+      targetAbs = await targetDir.resolveSymbolicLinks();
+    } on FileSystemException {
+      targetAbs = targetDir.absolute.path;
+    }
 
     // Use epub_pro so href semantics align with EpubExtractor: chapter
     // contentFileName + manifest hrefs are both OPF-relative, and
@@ -194,7 +206,10 @@ class EpubImageExtractor {
     final chaptersInOrder = _collectAllChapterHrefsInSpineOrder(epubBook);
 
     final figures = <ExtractedFigure>[];
-    final sectionLocalCounter = <int, int>{}; // identityHash → counter
+    // Identity-keyed: BookSection has structural equality, so two
+    // distinct sections with the same title would collide in a
+    // value-keyed Map and corrupt the per-section index.
+    final sectionLocalCounter = HashMap<BookSection, int>.identity();
     final dedupBySha = <String, _DedupSlot>{}; // sha256 → slot
 
     for (final href in chaptersInOrder) {
@@ -251,8 +266,7 @@ class EpubImageExtractor {
               sectionsForChapter,
               anchorPositions,
             );
-            final ownerKey = identityHashCode(owner);
-            final localIdx = sectionLocalCounter[ownerKey] ?? 0;
+            final localIdx = sectionLocalCounter[owner] ?? 0;
 
             final extracted = _materialize(
               ref: imageRef,
@@ -268,7 +282,7 @@ class EpubImageExtractor {
             );
             if (extracted != null) {
               figures.add(extracted);
-              sectionLocalCounter[ownerKey] = localIdx + 1;
+              sectionLocalCounter[owner] = localIdx + 1;
             }
 
             // Qualifying elements always increment the DOM index, even
@@ -405,6 +419,25 @@ class EpubImageExtractor {
 
     // ----- data: URI -----
     if (src.startsWith('data:')) {
+      // Defense in depth: cap the *encoded* payload length before
+      // touching base64.decode. Base64 is ~4/3 the binary size, so
+      // encoded > maxDataUriBytes * 4/3 + slack is unambiguously
+      // over-cap. We use a conservative 2x ceiling to allow URL-
+      // encoded variants and the `data:[<mime>][;base64],` prefix,
+      // and still reject DoS-sized payloads before the decoder runs.
+      final commaIdx = src.indexOf(',');
+      if (commaIdx >= 0) {
+        final encodedLen = src.length - commaIdx - 1;
+        final maxEncoded = guardLimits.maxDataUriBytes * 2;
+        if (encodedLen > maxEncoded) {
+          _logger.warning(
+            'data: URI in "$chapterHref" at DOM idx $domIndex '
+            '(encoded length $encodedLen) exceeds pre-decode bound '
+            '$maxEncoded (≈2× EPUB_MAX_DATA_URI_BYTES) — skipped',
+          );
+          return null;
+        }
+      }
       final decoded = _decodeDataUri(src);
       if (decoded == null) {
         _logger.fine(
@@ -461,6 +494,21 @@ class EpubImageExtractor {
     // (or similar); image src may be `images/x.png` or `../img/x.png`.
     final chapterDir = p.dirname(chapterHref);
     final cleanedSrc = _stripFragment(src);
+    // Reject Windows-style separators and drive markers in the *raw*
+    // src before normalization. `package:path` on POSIX treats `\` as
+    // a literal char and `C:` as a path segment, so a payload like
+    // `..\..\etc\passwd` or `C:\foo` would slip past `p.normalize`'s
+    // `..` collapsing and only get caught by the output-side
+    // `p.isWithin` check at write time. Catching it here keeps
+    // attribution and DOM-index stable for legitimate images.
+    if (cleanedSrc.contains('\\') ||
+        RegExp(r'^[a-zA-Z]:').hasMatch(cleanedSrc)) {
+      _logger.warning(
+        'Image in "$chapterHref" uses Windows-style path '
+        'separators or drive marker ("$cleanedSrc") — rejected',
+      );
+      return null;
+    }
     final resolvedRaw = chapterDir.isEmpty || chapterDir == '.'
         ? cleanedSrc
         : p.normalize(p.join(chapterDir, cleanedSrc));
@@ -581,7 +629,10 @@ class EpubImageExtractor {
   /// Sanitize SVG bytes:
   ///   - reject if content contains `<!DOCTYPE` or `<!ENTITY` (XXE).
   ///   - reject if any `xlink:href` / `href` attribute uses a
-  ///     non-relative scheme (`http:`, `https:`, `file:`, etc.).
+  ///     non-relative scheme (`http:`, `https:`, `file:`, etc.) —
+  ///     including XML-entity-encoded forms like `http&#58;//evil` or
+  ///     `&#x68;ttp://evil`, which would otherwise sneak past a raw
+  ///     scheme check by hiding the `:` behind a numeric reference.
   /// On rejection returns null. On success returns the (unmodified)
   /// bytes — sanitization is reject-on-violation, not silent rewrite,
   /// so the caller can log a clear "rejected" reason.
@@ -593,13 +644,18 @@ class EpubImageExtractor {
     }
     // Reject non-relative href / xlink:href schemes inside SVG content.
     // Done as a textual scan rather than a parse to keep this fast and
-    // independent of XML parser availability.
+    // independent of XML parser availability. We decode common XML
+    // numeric character references in the captured value so that
+    // `http&#58;//evil` doesn't slip past the scheme check via
+    // entity-encoded `:`.
     final hrefRe = RegExp(
       r'''(xlink:href|href)\s*=\s*(["'])([^"']*)["']''',
       caseSensitive: false,
     );
     for (final m in hrefRe.allMatches(text)) {
-      final v = (m.group(3) ?? '').trim().toLowerCase();
+      final raw = (m.group(3) ?? '').trim();
+      if (raw.isEmpty) continue;
+      final v = _decodeXmlNumericRefs(raw).toLowerCase();
       if (v.isEmpty) continue;
       if (v.startsWith('#')) continue; // intra-doc anchor
       if (v.startsWith('data:')) continue; // inline data URI
@@ -609,6 +665,30 @@ class EpubImageExtractor {
       return null;
     }
     return bytes;
+  }
+
+  /// Decode XML numeric character references (`&#NN;`, `&#xHH;`) in
+  /// [s]. Named entities like `&amp;` are NOT decoded — they're not a
+  /// vector for hiding a colon in a URL scheme. This is intentionally
+  /// permissive on malformed input: bad references are left as-is so
+  /// the surrounding text scan can still reject suspicious results.
+  String _decodeXmlNumericRefs(String s) {
+    if (!s.contains('&#')) return s;
+    return s.replaceAllMapped(
+      RegExp(r'&#(?:([0-9]{1,7})|x([0-9a-fA-F]{1,6}));'),
+      (m) {
+        final dec = m.group(1);
+        final hex = m.group(2);
+        try {
+          final code = dec != null
+              ? int.parse(dec)
+              : int.parse(hex!, radix: 16);
+          return String.fromCharCode(code);
+        } catch (_) {
+          return m.group(0)!;
+        }
+      },
+    );
   }
 
   /// Decode a `data:[<mime>][;base64],<data>` URI into bytes + mime.
@@ -792,10 +872,15 @@ BookSection embedImagePathsInTree(
 
 /// Group an extraction result's figures by owner section. Sections
 /// with no figures are not included.
+///
+/// Identity-keyed because [BookSection] has structural equality —
+/// using `Map<BookSection, ...>` directly would collide value-equal
+/// sections (e.g. two empty placeholder sections in a malformed TOC),
+/// silently merging their figure lists.
 Map<BookSection, List<ExtractedFigure>> groupFiguresBySection(
   EpubImageExtractionResult result,
 ) {
-  final out = <BookSection, List<ExtractedFigure>>{};
+  final out = HashMap<BookSection, List<ExtractedFigure>>.identity();
   for (final f in result.figures) {
     final owner = f.ownerSection;
     if (owner == null) continue;
