@@ -143,11 +143,25 @@ class EpubExtractionResult {
   /// tool, used by the GUI preview pane only.
   final Map<String, String> rawHtmlByHref;
 
+  /// OPF-relative chapter href → sanitized chapter HTML (post
+  /// [prepareChapterHtml]). Keys mirror [rawHtmlByHref]; values are
+  /// safe to feed directly into renderers and are stamped with
+  /// `data-figure-idx` markers that consumers rewrite to their
+  /// figure-storage paths after image extraction.
+  final Map<String, String> chapterHtmlByHref;
+
+  /// Sanitizer policy version that produced [chapterHtmlByHref].
+  /// Renderers that don't recognize the version should fall back to
+  /// plain-text rendering.
+  final int chapterHtmlSanitizerVersion;
+
   const EpubExtractionResult({
     required this.root,
     required this.chapters,
     required this.metadata,
     this.rawHtmlByHref = const {},
+    this.chapterHtmlByHref = const {},
+    this.chapterHtmlSanitizerVersion = 0,
   });
 }
 

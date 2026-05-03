@@ -13,6 +13,7 @@ import 'dart:typed_data';
 import 'package:epub_pro/epub_pro.dart';
 import 'package:quizpilgrim_book_model/quizpilgrim_book_model.dart';
 
+import 'chapter_html_processor.dart';
 import 'epub_data.dart';
 import 'epub_extraction_result.dart';
 import 'epub_guards.dart';
@@ -118,11 +119,21 @@ class EpubExtractor {
       if (raw != null) htmlMap[entry.key] = raw;
     }
 
+    final preparedHtmlMap = <String, String>{};
+    var sanitizerVersion = 0;
+    for (final entry in htmlMap.entries) {
+      final prepared = prepareChapterHtml(entry.value);
+      preparedHtmlMap[entry.key] = prepared.htmlContent;
+      sanitizerVersion = prepared.sanitizerVersion;
+    }
+
     return EpubExtractionResult(
       root: root,
       chapters: chapterContents,
       metadata: metadata,
       rawHtmlByHref: Map.unmodifiable(htmlMap),
+      chapterHtmlByHref: Map.unmodifiable(preparedHtmlMap),
+      chapterHtmlSanitizerVersion: sanitizerVersion,
     );
   }
 
