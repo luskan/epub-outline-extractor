@@ -6,6 +6,8 @@ library;
 
 import 'package:html/parser.dart' as html_parser;
 import 'package:html/dom.dart' as dom;
+
+import 'extracted_text.dart';
 import 'text_parsing_utils.dart';
 
 /// Default heading level (h2) used when extracting section text
@@ -79,7 +81,9 @@ String extractSectionText(
       logger?.call(
         '    Extracting from beginning until fragment: $nextFragmentId',
       );
-      return _extractTextUntilElement(document, nextFragmentId, logger);
+      final emitter = _StructuredEmitter();
+      _extractUntilElement(document, nextFragmentId, emitter, logger);
+      return cleanExtractedText(emitter.text);
     }
     // No fragments at all - this is likely the entire chapter
     logger?.call(
@@ -103,18 +107,148 @@ String extractSectionText(
   );
 
   // Case 3: Extract from fragment to next fragment or heading
-  return _extractTextFromElement(
+  final emitter = _StructuredEmitter();
+  _extractFromElement(
     document,
     startElement,
     nextFragmentId,
+    emitter,
     logger,
+  );
+  return cleanExtractedText(emitter.text);
+}
+
+/// Structured variant of [extractSectionText]: walks the same way but also
+/// tracks preserved ranges and element ranges for the structured-content
+/// pipeline.
+///
+/// Returns a [SectionExtraction] whose [SectionExtraction.extracted] is the
+/// **raw, pre-cleaning** [ExtractedText]. Pipe through
+/// [TextCleaner.cleanExtractedTextRespectingRanges] to get the cleaned form
+/// with ranges remapped.
+SectionExtraction extractSectionStructured(
+  String htmlContent,
+  String? fragmentId,
+  String? nextFragmentId, {
+  void Function(String)? logger,
+}) {
+  final document = html_parser.parse(htmlContent);
+  document.querySelectorAll('script, style').forEach((e) => e.remove());
+
+  final emitter = _StructuredEmitter();
+  dom.Element? startElement;
+  dom.Element? endElement;
+
+  if (fragmentId == null) {
+    if (nextFragmentId != null) {
+      endElement = document.querySelector('#$nextFragmentId') ??
+          document.querySelector('[name="$nextFragmentId"]');
+      _extractUntilElement(document, nextFragmentId, emitter, logger);
+    } else {
+      _walkAll(document, emitter);
+    }
+  } else {
+    startElement = document.querySelector('#$fragmentId') ??
+        document.querySelector('[name="$fragmentId"]');
+    if (startElement != null) {
+      if (nextFragmentId != null) {
+        endElement = document.querySelector('#$nextFragmentId') ??
+            document.querySelector('[name="$nextFragmentId"]');
+      }
+      _extractFromElement(
+        document,
+        startElement,
+        nextFragmentId,
+        emitter,
+        logger,
+      );
+    }
+  }
+
+  return SectionExtraction(
+    extracted: emitter.toExtractedText(document),
+    sectionStartElement: startElement,
+    sectionEndElement: endElement,
   );
 }
 
-/// Extract text until a specific element ID.
-String _extractTextUntilElement(
+/// Whole-chapter structured variant: walks the whole document body and
+/// returns the raw extraction. Used for chapters without fragment-based
+/// sections.
+ExtractedText extractStructured(String htmlContent) {
+  final document = html_parser.parse(htmlContent);
+  document.querySelectorAll('script, style').forEach((e) => e.remove());
+
+  final emitter = _StructuredEmitter();
+  final body = document.body;
+  if (body != null) {
+    _walkAll(body, emitter);
+  }
+  return emitter.toExtractedText(document);
+}
+
+/// Walk every node in the subtree rooted at [root] and emit text via
+/// [emitter]. Used for both whole-chapter and "until-fragment" extraction
+/// variants.
+void _walkAll(dom.Node root, _StructuredEmitter emitter) {
+  if (root is dom.Text) {
+    emitter.writeText(root.text);
+    return;
+  }
+  if (root is dom.Element) {
+    _walkElement(root, emitter);
+    return;
+  }
+  // Document or DocumentFragment.
+  for (final c in root.nodes) {
+    _walkAll(c, emitter);
+  }
+}
+
+/// Recurse into [element], dispatching on tag for preserve/figcaption/br
+/// behavior, then recurse into children.
+void _walkElement(dom.Element element, _StructuredEmitter emitter) {
+  final tag = element.localName?.toLowerCase();
+  if (tag == 'br') {
+    emitter.writeLineBreak();
+    return;
+  }
+  final isPre = tag == 'pre';
+  final isFigcaption = tag == 'figcaption';
+
+  // Block elements get a `\n\n` separator before their content (matches
+  // existing emitter's behavior).
+  if (isBlockElement(element)) {
+    emitter.writeBlockSeparator();
+  }
+
+  if (isPre) {
+    emitter.enterPreserve(element);
+    for (final c in element.nodes) {
+      _walkAll(c, emitter);
+    }
+    emitter.exitPreserve(element);
+  } else if (isFigcaption) {
+    emitter.enterFigcaption(element);
+    for (final c in element.nodes) {
+      _walkAll(c, emitter);
+    }
+    emitter.exitFigcaption(element);
+  } else {
+    for (final c in element.nodes) {
+      _walkAll(c, emitter);
+    }
+  }
+}
+
+/// Internal: extract text walking document linearly until an element with
+/// the given fragment ID is encountered. Mirrors the legacy
+/// `_extractTextUntilElement` but writes to a [_StructuredEmitter] for
+/// downstream structured tracking.
+void _extractUntilElement(
   dom.Document document,
   String elementId,
+  _StructuredEmitter emitter,
   void Function(String)? logger,
 ) {
   final endElement =
@@ -125,47 +259,57 @@ String _extractTextUntilElement(
     logger?.call(
       '    WARNING: End fragment ID "$elementId" not found in HTML!',
     );
-    return '';
+    return;
   }
 
-  final textParts = <String>[];
+  bool stopped = false;
 
-  void walkNodes(dom.Node node, {bool stopAtEnd = true}) {
-    if (stopAtEnd && node == endElement) {
+  void walkNodes(dom.Node node) {
+    if (stopped) return;
+    if (node == endElement) {
+      stopped = true;
       return;
     }
 
     if (node.nodeType == dom.Node.TEXT_NODE) {
-      final text = node.text ?? '';
-      if (text.isNotEmpty) {
-        textParts.add(text);
-      }
+      emitter.writeText(node.text ?? '');
     } else if (node is dom.Element) {
-      if (node.localName?.toLowerCase() == 'br') {
-        textParts.add('\n');
+      final tag = node.localName?.toLowerCase();
+      if (tag == 'br') {
+        emitter.writeLineBreak();
       } else if (isBlockElement(node)) {
-        textParts.add('\n\n');
+        emitter.writeBlockSeparator();
       }
+
+      final isPre = tag == 'pre';
+      final isFigcaption = tag == 'figcaption';
+
+      if (isPre) emitter.enterPreserve(node);
+      if (isFigcaption) emitter.enterFigcaption(node);
+
       for (final child in node.nodes) {
         walkNodes(child);
-        if (stopAtEnd && child == endElement) break;
+        if (stopped) break;
       }
+
+      if (isPre) emitter.exitPreserve(node);
+      if (isFigcaption) emitter.exitFigcaption(node);
     }
   }
 
   walkNodes(document);
-
-  return cleanExtractedText(textParts.join());
 }
 
-/// Extract text from element until next section.
-String _extractTextFromElement(
+/// Internal: extract text walking from a starting element until the next
+/// fragment / same-or-higher heading. Mirrors the legacy
+/// `_extractTextFromElement` but writes to a [_StructuredEmitter].
+void _extractFromElement(
   dom.Document document,
   dom.Element startElement,
   String? nextFragmentId,
+  _StructuredEmitter emitter,
   void Function(String)? logger,
 ) {
-  final textParts = <String>[];
   var hasCollectedContent = false;
 
   // Determine where to actually start traversal and what heading level to use
@@ -186,9 +330,67 @@ String _extractTextFromElement(
   var passedStartHeading = (startLevel == null);
   var isFirstIteration = true;
 
+  // Track preserve/figcaption depth via ancestor chains. The linear
+  // (`getNextNode`) walk can cross element boundaries silently, so we
+  // sample the ancestor chain at each step to know whether we're inside a
+  // <pre> or <figcaption>. The emitter's preserve stack is updated at
+  // boundary transitions only.
+  dom.Element? currentPreserveAncestor;
+  dom.Element? currentFigcaptionAncestor;
+
+  dom.Element? findPreserveAncestor(dom.Node? node) {
+    var cur = node;
+    while (cur != null) {
+      if (cur is dom.Element && cur.localName?.toLowerCase() == 'pre') {
+        return cur;
+      }
+      cur = cur.parent;
+    }
+    return null;
+  }
+
+  dom.Element? findFigcaptionAncestor(dom.Node? node) {
+    var cur = node;
+    while (cur != null) {
+      if (cur is dom.Element &&
+          cur.localName?.toLowerCase() == 'figcaption') {
+        return cur;
+      }
+      cur = cur.parent;
+    }
+    return null;
+  }
+
+  void syncAncestorState(dom.Node? node) {
+    final newPre = findPreserveAncestor(node);
+    final priorPre = currentPreserveAncestor;
+    if (newPre != priorPre) {
+      if (priorPre != null) {
+        emitter.exitPreserve(priorPre);
+      }
+      if (newPre != null) {
+        emitter.enterPreserve(newPre);
+      }
+      currentPreserveAncestor = newPre;
+    }
+    final newFig = findFigcaptionAncestor(node);
+    final priorFig = currentFigcaptionAncestor;
+    if (newFig != priorFig) {
+      if (priorFig != null) {
+        emitter.exitFigcaption(priorFig);
+      }
+      if (newFig != null) {
+        emitter.enterFigcaption(newFig);
+      }
+      currentFigcaptionAncestor = newFig;
+    }
+  }
+
   dom.Node? current = actualStart;
 
   while (current != null) {
+    syncAncestorState(current);
+
     // Check if we reached next fragment by its ID
     if (nextFragmentId != null && current is dom.Element) {
       if (current.id == nextFragmentId ||
@@ -228,7 +430,7 @@ String _extractTextFromElement(
     if (shouldCollect && current.nodeType == dom.Node.TEXT_NODE) {
       final text = current.text ?? '';
       if (text.isNotEmpty) {
-        textParts.add(text);
+        emitter.writeText(text);
         if (text.trim().isNotEmpty) {
           hasCollectedContent = true;
         }
@@ -237,16 +439,18 @@ String _extractTextFromElement(
 
     if (current is dom.Element) {
       if (current.localName?.toLowerCase() == 'br') {
-        textParts.add('\n');
+        emitter.writeLineBreak();
       } else if (isBlockElement(current)) {
-        textParts.add('\n\n');
+        emitter.writeBlockSeparator();
       }
     }
 
     current = getNextNode(current);
   }
 
-  return cleanExtractedText(textParts.join());
+  // Close any still-open ancestor span (defensive — a section could end
+  // mid-<pre>).
+  syncAncestorState(null);
 }
 
 /// Get next node in document order (depth-first traversal).
@@ -405,4 +609,133 @@ bool isInsideNoteOrSidebar(dom.Element element) {
     current = current.parent;
   }
   return false;
+}
+
+/// A scratch span on the emitter's preserve stack — records the buffer
+/// position when entering a `<pre>` so the exit handler can close the
+/// range cleanly.
+class _PreserveSpan {
+  final dom.Element element;
+  final int startPos;
+  const _PreserveSpan(this.element, this.startPos);
+}
+
+/// Emits text into a [StringBuffer] while tracking preserved ranges
+/// (for `<pre>`) and element ranges (for `<figcaption>` in v1.0; lists,
+/// tables, dl items in v1.1/v1.2).
+///
+/// Tab→4-space normalisation happens during preserve-mode writes so the
+/// renderer doesn't have to know about tabs (plan §5.3).
+class _StructuredEmitter {
+  final StringBuffer _buffer = StringBuffer();
+  final List<TextRange> _preservedRanges = [];
+  final Map<dom.Element, List<TextRange>> _elementRanges = {};
+
+  // Stack of currently-open preserve spans. A reentrancy stack handles
+  // nested <pre> (rare but legal — avoids state corruption).
+  final List<_PreserveSpan> _preserveStack = [];
+  // Single open figcaption span (figcaptions are not nested in practice).
+  _PreserveSpan? _figcaptionSpan;
+
+  bool get _inPreserveMode => _preserveStack.isNotEmpty;
+
+  String get text => _buffer.toString();
+
+  void writeText(String text) {
+    if (text.isEmpty) return;
+    if (_inPreserveMode) {
+      // Preserve verbatim, with tab→4-space normalisation and \r dropped.
+      // Plan §5.3.
+      final normalised =
+          text.replaceAll('\t', '    ').replaceAll('\r', '');
+      _buffer.write(normalised);
+    } else {
+      _buffer.write(text);
+    }
+  }
+
+  void writeBlockSeparator() {
+    if (_inPreserveMode) {
+      // Inside a <pre>, block separators are emitted as literal `\n\n` of
+      // the source — we don't want to add structural separators to code.
+      return;
+    }
+    _buffer.write('\n\n');
+  }
+
+  void writeLineBreak() {
+    _buffer.write('\n');
+  }
+
+  void enterPreserve(dom.Element element) {
+    _preserveStack.add(_PreserveSpan(element, _buffer.length));
+  }
+
+  void exitPreserve(dom.Element element) {
+    // Walk up the stack to find the matching span. In practice this is
+    // always the top of the stack, but defensively scan in case of
+    // unexpected nesting.
+    for (var i = _preserveStack.length - 1; i >= 0; i--) {
+      if (_preserveStack[i].element == element) {
+        final span = _preserveStack.removeAt(i);
+        final endPos = _buffer.length;
+        if (endPos > span.startPos) {
+          final range = TextRange(span.startPos, endPos);
+          _preservedRanges.add(range);
+          _elementRanges[element] = [range];
+        }
+        return;
+      }
+    }
+  }
+
+  void enterFigcaption(dom.Element element) {
+    _figcaptionSpan = _PreserveSpan(element, _buffer.length);
+    // Treat figcaption content as a PRESERVED range so the cleaner
+    // doesn't collapse internal whitespace and corrupt the figcaption's
+    // tracked offsets. Without this, the coarse 3-edit diff in
+    // `cleanTextRespectingRanges` could collapse an outside segment
+    // containing prose + figcaption + boundary into one Replace, leaving
+    // the figcaption's `mapStart`/`mapEnd` pointing at the wrong span.
+    // Pushing the figcaption text through verbatim keeps its element
+    // range stable across the cleaner.
+    _preserveStack.add(_PreserveSpan(element, _buffer.length));
+  }
+
+  void exitFigcaption(dom.Element element) {
+    final span = _figcaptionSpan;
+    if (span == null || span.element != element) return;
+    _figcaptionSpan = null;
+    // Close the matching preserve-stack entry from enterFigcaption.
+    for (var i = _preserveStack.length - 1; i >= 0; i--) {
+      if (_preserveStack[i].element == element) {
+        final preservedSpan = _preserveStack.removeAt(i);
+        final preservedEnd = _buffer.length;
+        if (preservedEnd > preservedSpan.startPos) {
+          _preservedRanges.add(
+            TextRange(preservedSpan.startPos, preservedEnd),
+          );
+        }
+        break;
+      }
+    }
+    final endPos = _buffer.length;
+    if (endPos > span.startPos) {
+      _elementRanges[element] = [TextRange(span.startPos, endPos)];
+    }
+  }
+
+  /// Build an [ExtractedText] from the emitter's current state. The caller
+  /// must pass the [document] used for parsing — it's the source of truth
+  /// for element identity.
+  ExtractedText toExtractedText(dom.Document document) {
+    // Drop any zero-length preserved ranges defensively (shouldn't happen).
+    final preserved = _preservedRanges.where((r) => !r.isEmpty).toList();
+    return ExtractedText(
+      text: _buffer.toString(),
+      preservedRanges: preserved,
+      elementRanges: Map.of(_elementRanges),
+      document: document,
+    );
+  }
 }

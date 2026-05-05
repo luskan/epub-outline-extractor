@@ -17,6 +17,7 @@ import 'epub_data.dart';
 import 'epub_extraction_result.dart';
 import 'epub_guards.dart';
 import 'epub_structured_content_builder.dart';
+import 'extracted_text.dart';
 import 'html_text_extractor.dart';
 import 'text_cleaner.dart';
 import 'text_parsing_utils.dart';
@@ -379,8 +380,14 @@ class EpubExtractor {
         }
       }
 
-      // Extract section text.
+      // Extract section text. v1.0: for fragment-based sections, use the
+      // structured pipeline (extractSectionStructured → range-aware
+      // cleaner) so <pre> code blocks survive whitespace collapse and
+      // power preserveLineBreaks + monospace marks downstream. The
+      // legacy `extractSectionText` path is kept for safety on sections
+      // that fall through (no html content, etc.).
       String sectionText;
+      SectionExtraction? structuredExtraction;
       if (fragment != null || nextFragment != null) {
         final htmlContent = htmlContentMap[file];
         if (htmlContent == null) {
@@ -391,12 +398,40 @@ class EpubExtractor {
           continue;
         }
 
-        sectionText = extractSectionText(
-          htmlContent,
-          fragment,
-          nextFragment,
-          logger: _logger.fine,
-        );
+        // Defensive: any unexpected throw in the v1.0 pipeline (validator
+        // ArgumentError, EditScript RangeError, etc.) MUST NOT abort the
+        // whole EPUB import. Fall back to the legacy String-returning
+        // `extractSectionText` for this single section.
+        try {
+          final raw = extractSectionStructured(
+            htmlContent,
+            fragment,
+            nextFragment,
+            logger: _logger.fine,
+          );
+          final cleaned =
+              TextCleaner.cleanExtractedTextRespectingRanges(raw.extracted);
+          sectionText = cleaned.text;
+          structuredExtraction = SectionExtraction(
+            extracted: cleaned,
+            sectionStartElement: raw.sectionStartElement,
+            sectionEndElement: raw.sectionEndElement,
+          );
+        } catch (e, st) {
+          _logger.warning(
+            'v1.0 structured pipeline failed for "${tocItem.title}", '
+            'falling back to legacy extraction: $e',
+            e,
+            st,
+          );
+          sectionText = extractSectionText(
+            htmlContent,
+            fragment,
+            nextFragment,
+            logger: _logger.fine,
+          );
+          structuredExtraction = null;
+        }
 
         if (sectionText.length > 50000) {
           _logger.warning(
@@ -410,16 +445,25 @@ class EpubExtractor {
         sectionText = chapters[chapterIndex].text;
       }
 
-      // Generate structured content annotations (full-chapter HTML →
-      // section-text mapping).
+      // Generate structured content annotations.
+      // - With a structuredExtraction (v1.0 path): uses elementRanges to
+      //   emit <pre> code blocks with preserveLineBreaks + monospace.
+      // - Without (no-fragment chapter text): falls back to the legacy
+      //   fuzzy-match buildFromHtml.
       String? structuredJson;
       final sectionHtml = htmlContentMap[file];
       if (sectionText.isNotEmpty && sectionHtml != null) {
         try {
-          structuredJson = EpubStructuredContentBuilder.buildFromHtml(
-            sectionHtml,
-            sectionText,
-          );
+          if (structuredExtraction != null) {
+            structuredJson = EpubStructuredContentBuilder.build(
+              structuredExtraction,
+            );
+          } else {
+            structuredJson = EpubStructuredContentBuilder.buildFromHtml(
+              sectionHtml,
+              sectionText,
+            );
+          }
         } catch (e) {
           _logger.warning('Structured content extraction failed: $e');
         }

@@ -9,6 +9,7 @@
 /// previously reached into the mobile internals.
 library;
 
+export 'src/edit_script.dart';
 export 'src/epub_data.dart';
 export 'src/epub_extraction_result.dart';
 export 'src/epub_extractor.dart';
@@ -16,6 +17,7 @@ export 'src/epub_guards.dart';
 export 'src/epub_image_extractor.dart';
 export 'src/epub_serializer.dart';
 export 'src/epub_structured_content_builder.dart';
+export 'src/extracted_text.dart';
 export 'src/html_text_extractor.dart';
 export 'src/text_cleaner.dart';
 export 'src/text_parsing_utils.dart';
