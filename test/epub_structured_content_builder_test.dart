@@ -311,4 +311,483 @@ void main() {
       expect(parsed!.isValidFor(cleaned.text), isTrue);
     });
   });
+
+  group('EpubStructuredContentBuilder.build (v1.1 lists + dl)', () {
+    List<ContentBlock> buildFromFullPipeline(String html) {
+      final raw = extractStructured(html);
+      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
+      final extraction = SectionExtraction(
+        extracted: cleaned,
+        sectionStartElement: null,
+        sectionEndElement: null,
+      );
+      final json = EpubStructuredContentBuilder.build(extraction);
+      expect(json, isNotNull, reason: 'build returned null');
+      final parsed = StructuredContent.tryParse(json);
+      expect(parsed, isNotNull);
+      return parsed!.annotations;
+    }
+
+    String fullText(String html) {
+      final raw = extractStructured(html);
+      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
+      return cleaned.text;
+    }
+
+    test('<ul> emits listItem blocks with bullet markers', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ul><li>Apples are red.</li><li>Bananas are yellow.</li>'
+          '<li>Cherries are dark.</li></ul>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final items =
+          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      expect(items, hasLength(3));
+      for (final i in items) {
+        expect(i.listMarker, '•');
+      }
+    });
+
+    test('<ol> emits listItem blocks with numeric markers 1./2./3.', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ol><li>First step here.</li><li>Second step here.</li>'
+          '<li>Third step here.</li></ol>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final items =
+          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      expect(items, hasLength(3));
+      expect(items[0].listMarker, '1.');
+      expect(items[1].listMarker, '2.');
+      expect(items[2].listMarker, '3.');
+    });
+
+    test('<ol type="a"> emits a./b./c. markers', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ol type="a"><li>Alpha.</li><li>Beta.</li><li>Gamma.</li></ol>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final items =
+          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      expect(items.map((b) => b.listMarker), ['a.', 'b.', 'c.']);
+    });
+
+    test('<ol type="A"> emits A./B. markers', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ol type="A"><li>Alpha.</li><li>Beta.</li></ol>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final items =
+          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      expect(items.map((b) => b.listMarker), ['A.', 'B.']);
+    });
+
+    test('list item ranges land on the right substring of plain text', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ul><li>Apples</li><li>Bananas</li></ul>'
+          '</body></html>';
+      final raw = extractStructured(html);
+      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
+      final extraction = SectionExtraction(
+        extracted: cleaned,
+        sectionStartElement: null,
+        sectionEndElement: null,
+      );
+      final json = EpubStructuredContentBuilder.build(extraction);
+      final parsed = StructuredContent.tryParse(json);
+      final items = parsed!.annotations
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
+      expect(items, hasLength(2));
+      expect(cleaned.text.substring(items[0].start, items[0].end), 'Apples');
+      expect(
+        cleaned.text.substring(items[1].start, items[1].end),
+        'Bananas',
+      );
+    });
+
+    test('nested list flat emit (outer + inner, DOM order)', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ul><li>outer<ul><li>inner</li></ul></li></ul>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final items =
+          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      expect(items, hasLength(2));
+      // DOM order: outer before inner; ranges non-overlapping.
+      expect(items[0].end, lessThanOrEqualTo(items[1].start));
+    });
+
+    test('<li>outer<ul><li>inner</li></ul>tail</li>: 3 items, DOM order',
+        () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ul><li>outer<ul><li>inner</li></ul>tail</li></ul>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final items =
+          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      expect(items, hasLength(3));
+      // DOM order: outer → inner → tail.
+      expect(items[0].end, lessThanOrEqualTo(items[1].start));
+      expect(items[1].end, lessThanOrEqualTo(items[2].start));
+      // First slice has bullet marker, continuation slice has empty marker.
+      expect(items[0].listMarker, '•');
+      expect(items[1].listMarker, '•');
+      expect(items[2].listMarker, '');
+    });
+
+    test(
+        '<li><ul><li>inner</li></ul>tail</li>: no prefix → 2 items, '
+        'tail keeps bullet', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ul><li><ul><li>inner</li></ul>tail</li></ul>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final items =
+          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      expect(items, hasLength(2));
+      // Inner first, then tail — tail is the outer-li's first slice so it
+      // keeps the bullet marker (plan §5.8 trace).
+      expect(items[1].listMarker, '•');
+    });
+
+    test('<dl><dt>Term</dt><dd>def</dd></dl> emits one definitionItem block',
+        () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<dl><dt>Term word</dt><dd>The definition for that term.</dd></dl>'
+          '</body></html>';
+      final raw = extractStructured(html);
+      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
+      final extraction = SectionExtraction(
+        extracted: cleaned,
+        sectionStartElement: null,
+        sectionEndElement: null,
+      );
+      final json = EpubStructuredContentBuilder.build(extraction);
+      final parsed = StructuredContent.tryParse(json);
+      final defs = parsed!.annotations
+          .where((b) => b.type == ContentBlockType.definitionItem)
+          .toList();
+      expect(defs, hasLength(1));
+      final def = defs.single;
+      expect(def.definitionTermEnd, isNotNull);
+      // Term substring matches "Term word".
+      expect(
+        cleaned.text.substring(def.start, def.definitionTermEnd!),
+        'Term word',
+      );
+      // Full block covers term + definition.
+      expect(
+        cleaned.text.substring(def.start, def.end),
+        contains('The definition for that term.'),
+      );
+    });
+
+    test('hash validates for v1.1 list+dl JSON', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ul><li>One</li><li>Two</li></ul>'
+          '<dl><dt>Term</dt><dd>def</dd></dl>'
+          '</body></html>';
+      final raw = extractStructured(html);
+      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
+      final extraction = SectionExtraction(
+        extracted: cleaned,
+        sectionStartElement: null,
+        sectionEndElement: null,
+      );
+      final json = EpubStructuredContentBuilder.build(extraction);
+      final parsed = StructuredContent.tryParse(json);
+      expect(parsed, isNotNull);
+      expect(parsed!.isValidFor(cleaned.text), isTrue);
+    });
+
+    test('<li> with <pre> inside: pre still emits as code block, not '
+        'subsumed by listItem', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ul><li>Prelude text<pre>code body</pre></li></ul>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      // One listItem (for "Prelude text") + one code block (for <pre>).
+      final items =
+          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      final codes = blocks.where((b) => b.preserveLineBreaks).toList();
+      expect(items, hasLength(1));
+      expect(codes, hasLength(1));
+      expect(items.single.end, lessThanOrEqualTo(codes.single.start));
+    });
+
+    test('JSON round-trips listItem + definitionItem through model parser',
+        () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ul><li>One item</li></ul>'
+          '<dl><dt>Word</dt><dd>def</dd></dl>'
+          '</body></html>';
+      final raw = extractStructured(html);
+      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
+      final extraction = SectionExtraction(
+        extracted: cleaned,
+        sectionStartElement: null,
+        sectionEndElement: null,
+      );
+      final json = EpubStructuredContentBuilder.build(extraction);
+      // Re-parse and re-serialise to verify canonical round-trip.
+      final parsed = StructuredContent.tryParse(json);
+      expect(parsed, isNotNull);
+      final reSerialized = parsed!.toJsonString();
+      expect(reSerialized, json);
+      // Confirm types survive both ways.
+      expect(
+        parsed.annotations.any((b) => b.type == ContentBlockType.listItem),
+        isTrue,
+      );
+      expect(
+        parsed.annotations
+            .any((b) => b.type == ContentBlockType.definitionItem),
+        isTrue,
+      );
+    });
+
+    test('plain text contains list item content (sanity check)', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ul><li>Apples</li><li>Bananas</li></ul>'
+          '</body></html>';
+      final t = fullText(html);
+      expect(t, contains('Apples'));
+      expect(t, contains('Bananas'));
+    });
+
+    test('pretty-printed nested li (whitespace text nodes) emits in DOM '
+        'order: outer→inner→tail', () {
+      // Codex round-1 HIGH: leading "\n" text node before <ul> would
+      // previously pop the tail slice early, producing tail→inner.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ul><li>outer\n  <ul><li>inner</li></ul>\n  tail</li></ul>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final items =
+          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      expect(items, hasLength(3));
+      // DOM order: outer < inner < tail.
+      expect(items[0].end, lessThanOrEqualTo(items[1].start));
+      expect(items[1].end, lessThanOrEqualTo(items[2].start));
+      expect(items[0].listMarker, '•');
+      expect(items[1].listMarker, '•');
+      expect(items[2].listMarker, '');
+    });
+
+    test('pretty-printed no-prefix nested li still emits inner→tail', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ul><li>\n  <ul><li>inner</li></ul>\n  tail</li></ul>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final items =
+          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      expect(items, hasLength(2));
+      expect(items[0].end, lessThanOrEqualTo(items[1].start));
+      // Tail is the outer-li's first slice → bullet marker.
+      expect(items[1].listMarker, '•');
+    });
+
+    test(
+        '<dd>before<pre>code</pre>after</dd>: dt/dd shadows on <pre>; no '
+        'preserved-boundary straddle', () {
+      // Codex round-1 MEDIUM: without block shadowing in findDtDdAncestor,
+      // dd's recorded range would straddle the pre's preserved range and
+      // ExtractedText constructor would throw.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<dl><dt>Term</dt><dd>before<pre>code body</pre>after</dd></dl>'
+          '</body></html>';
+      // Should not throw.
+      final blocks = buildFromFullPipeline(html);
+      // Pre still emits as a code block.
+      expect(
+        blocks.where((b) => b.preserveLineBreaks).toList(),
+        hasLength(1),
+      );
+    });
+
+    test('<li><a>foo<div><pre>code</pre></div>bar</a></li>: inline-wrapped '
+        'block descendants split listItem slices and emit code block', () {
+      // Codex round-2 MEDIUM: a flat li.nodes iteration would treat <a>
+      // as one inline child and pop one slice, missing the second slice
+      // and the nested code block.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ul><li><a>foo<div><pre>code body</pre></div>bar</a></li></ul>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final items =
+          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      final codes = blocks.where((b) => b.preserveLineBreaks).toList();
+      // Two listItem slices (foo, bar) + one code block.
+      expect(items, hasLength(2));
+      expect(codes, hasLength(1));
+      // DOM order: foo → code → bar.
+      expect(items[0].end, lessThanOrEqualTo(codes.single.start));
+      expect(codes.single.end, lessThanOrEqualTo(items[1].start));
+    });
+
+    test('<dd><pre>code</pre>after</dd>: pre-before-text dd emits term-only '
+        'definitionItem and code block', () {
+      // Codex round-2 MEDIUM: dd's first slice = "after" (pre shadows);
+      // a definitionItem covering [dt.start, after.end) would span the
+      // pre, suppressing it via the searchFrom overlap guard. Term-only
+      // mode (when block descendants present) preserves the code block.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<dl><dt>Term</dt>'
+          '<dd><pre>code body</pre>after</dd></dl>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final defs = blocks
+          .where((b) => b.type == ContentBlockType.definitionItem)
+          .toList();
+      final codes = blocks.where((b) => b.preserveLineBreaks).toList();
+      expect(defs, hasLength(1));
+      expect(codes, hasLength(1));
+      // DOM order: definitionItem → code block.
+      expect(defs.single.end, lessThanOrEqualTo(codes.single.start));
+    });
+
+    test('<dt>Term<pre>code</pre></dt><dd>def</dd>: dt with block descendants '
+        'emits term-only definitionItem and code block, dd is orphan', () {
+      // Codex round-3 MEDIUM: previously, the dd would emit definitionItem
+      // [dt.start, dd.end) which spans the pre, suppressing the code block.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<dl><dt>Term<pre>code body</pre></dt>'
+          '<dd>some definition text</dd></dl>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final defs = blocks
+          .where((b) => b.type == ContentBlockType.definitionItem)
+          .toList();
+      final codes = blocks.where((b) => b.preserveLineBreaks).toList();
+      // One definitionItem (term-only from dt) + one code block.
+      // The dd is orphan because we already consumed activeDtRange.
+      expect(defs, hasLength(1));
+      expect(codes, hasLength(1));
+      // DOM order: term → code.
+      expect(defs.single.end, lessThanOrEqualTo(codes.single.start));
+    });
+
+    test('<dt><pre>code</pre>Term</dt><dd>def</dd>: pre BEFORE term still '
+        'emits both code and term-only definitionItem in DOM order', () {
+      // Codex round-4 MEDIUM: reversed-order dt (block before text).
+      // Walking dt children in DOM order dispatches the pre first (code
+      // block), then emits the term-only definitionItem at the term's
+      // position — searchFrom monotonicity preserved.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<dl><dt><pre>code body</pre>Term</dt>'
+          '<dd>some definition text</dd></dl>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final defs = blocks
+          .where((b) => b.type == ContentBlockType.definitionItem)
+          .toList();
+      final codes = blocks.where((b) => b.preserveLineBreaks).toList();
+      expect(defs, hasLength(1));
+      expect(codes, hasLength(1));
+      // DOM order: code → term-only definitionItem.
+      expect(codes.single.end, lessThanOrEqualTo(defs.single.start));
+    });
+
+    test('<dt><div><a><pre>code</pre></a></div>Term</dt>: deeply '
+        'inline-wrapped block descendant in dt still emits as code', () {
+      // Codex round-5 MEDIUM: <pre> wrapped in <div><a> inside dt would
+      // be lost because _walkBlocks recursed into <div> but _dispatchNode
+      // didn't recurse into inline <a>.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<dl><dt><div><a><pre>code body</pre></a></div>Term</dt>'
+          '<dd>def text</dd></dl>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final defs = blocks
+          .where((b) => b.type == ContentBlockType.definitionItem)
+          .toList();
+      final codes = blocks.where((b) => b.preserveLineBreaks).toList();
+      expect(defs, hasLength(1));
+      expect(codes, hasLength(1));
+      // DOM order: code → term-only definitionItem.
+      expect(codes.single.end, lessThanOrEqualTo(defs.single.start));
+    });
+
+    test('<dl><dd>orphan</dd>: orphan dd dispatches block descendants but '
+        'emits no definitionItem', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<dl><dd>orphan with <pre>code body</pre> inside</dd></dl>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final defs = blocks
+          .where((b) => b.type == ContentBlockType.definitionItem)
+          .toList();
+      final codes = blocks.where((b) => b.preserveLineBreaks).toList();
+      expect(defs, isEmpty);
+      expect(codes, hasLength(1));
+    });
+
+    test('body-level inline element wrapping a block still dispatches', () {
+      // Senior round-final MEDIUM: defensive coverage for the
+      // _dispatchNode inline-fallthrough at chapter root. Without the
+      // fallthrough, <span><p>...</p></span> at body level would never
+      // dispatch the <p>.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<span><div><p>nested para inside span</p></div></span>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final paragraphs = blocks
+          .where((b) => b.type == ContentBlockType.paragraph)
+          .toList();
+      // Padding paragraph + nested paragraph inside span/div.
+      expect(paragraphs.length, greaterThanOrEqualTo(2));
+    });
+
+    test('lists emit in beginning-only section (no fragmentId, with '
+        'nextFragmentId)', () {
+      // Codex round-1 MEDIUM: _extractUntilElement previously skipped
+      // li/dtdd sync, so leading sections produced no listItem blocks.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ul><li>One</li><li>Two</li></ul>'
+          '<h2 id="next">Next section</h2>'
+          '<p>Other text.</p>'
+          '</body></html>';
+      final raw = extractSectionStructured(html, null, 'next');
+      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(
+        raw.extracted,
+      );
+      final extraction = SectionExtraction(
+        extracted: cleaned,
+        sectionStartElement: raw.sectionStartElement,
+        sectionEndElement: raw.sectionEndElement,
+      );
+      final json = EpubStructuredContentBuilder.build(extraction);
+      final parsed = StructuredContent.tryParse(json);
+      expect(parsed, isNotNull);
+      final items = parsed!.annotations
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
+      expect(items, hasLength(2));
+    });
+  });
 }

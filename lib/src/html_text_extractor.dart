@@ -184,6 +184,11 @@ ExtractedText extractStructured(String htmlContent) {
   if (body != null) {
     _walkAll(body, emitter);
   }
+  // Symmetry with the linear walkers: explicitly close any open li/dt/dd
+  // state. toExtractedText also defensively cleans up, but doing it here
+  // keeps the emitter's lifecycle consistent across all extraction paths.
+  emitter.syncDirectLi(null);
+  emitter.syncDtDd(null);
   return emitter.toExtractedText(document);
 }
 
@@ -191,6 +196,14 @@ ExtractedText extractStructured(String htmlContent) {
 /// [emitter]. Used for both whole-chapter and "until-fragment" extraction
 /// variants.
 void _walkAll(dom.Node root, _StructuredEmitter emitter) {
+  // Sync ancestor-derived state (closest <li>, closest <dt>/<dd>) so the
+  // emitter can attribute text to the right element. Done at the start of
+  // every node visit — that timing puts close-slice transitions BEFORE any
+  // block separator is written for the new node, keeping slice ranges off
+  // of inter-block whitespace.
+  emitter.syncDirectLi(findDirectLi(root));
+  emitter.syncDtDd(findDtDdAncestor(root));
+
   if (root is dom.Text) {
     emitter.writeText(root.text);
     return;
@@ -271,6 +284,13 @@ void _extractUntilElement(
       return;
     }
 
+    // Sync li/dtdd ancestor state so v1.1 list/dl tracking fires for
+    // sections extracted via the no-fragment-id-but-end-fragment path
+    // (codex round-1 MEDIUM: previously this walker skipped sync, leaving
+    // leading sections without listItem / definitionItem blocks).
+    emitter.syncDirectLi(findDirectLi(node));
+    emitter.syncDtDd(findDtDdAncestor(node));
+
     if (node.nodeType == dom.Node.TEXT_NODE) {
       emitter.writeText(node.text ?? '');
     } else if (node is dom.Element) {
@@ -294,10 +314,22 @@ void _extractUntilElement(
 
       if (isPre) emitter.exitPreserve(node);
       if (isFigcaption) emitter.exitFigcaption(node);
+    } else {
+      // Document / DocumentFragment — recurse into children. (Without
+      // this branch, `walkNodes(document)` did nothing because Document
+      // is neither a Text nor an Element node, so the no-fragmentId
+      // beginning-only-section extraction path produced empty output.)
+      for (final child in node.nodes) {
+        walkNodes(child);
+        if (stopped) break;
+      }
     }
   }
 
   walkNodes(document);
+  // Close any still-open li / dt-dd state at end of walk.
+  emitter.syncDirectLi(null);
+  emitter.syncDtDd(null);
 }
 
 /// Internal: extract text walking from a starting element until the next
@@ -384,6 +416,8 @@ void _extractFromElement(
       }
       currentFigcaptionAncestor = newFig;
     }
+    emitter.syncDirectLi(findDirectLi(node));
+    emitter.syncDtDd(findDtDdAncestor(node));
   }
 
   dom.Node? current = actualStart;
@@ -451,6 +485,49 @@ void _extractFromElement(
   // Close any still-open ancestor span (defensive — a section could end
   // mid-<pre>).
   syncAncestorState(null);
+}
+
+/// Walking up from [node], return the closest `<li>` ancestor whose direct
+/// text [node] contributes to. Returns null if [node] is shadowed by an
+/// intervening block-level element — in that case the text belongs to a
+/// nested block (another list, a code block, a figure, a table, etc.),
+/// not directly to the enclosing `<li>`. Plan §5.8 specifies `<ul>` / `<ol>`
+/// shadowing for nested lists; we generalise to all block tags so that a
+/// `<li>` whose only "content" is `<figure class="code"><pre>...</pre></figure>`
+/// produces an empty direct-text slice (correct: the code block emits at
+/// its own range, not as part of the list item).
+dom.Element? findDirectLi(dom.Node? node) {
+  var cur = node;
+  while (cur != null) {
+    if (cur is dom.Element) {
+      final tag = cur.localName?.toLowerCase();
+      if (tag == 'li') return cur;
+      if (isBlockElement(cur)) return null;
+    }
+    cur = cur.parent;
+  }
+  return null;
+}
+
+/// Walking up from [node], return the closest `<dt>` or `<dd>` ancestor.
+/// Used by the structured emitter to record per-term/per-definition ranges.
+///
+/// Mirrors [findDirectLi]'s shadowing rule: an intervening block-level
+/// element (e.g. `<pre>` inside a `<dd>`) returns null, so the dt/dd's
+/// recorded range never straddles a preserved-content boundary (codex
+/// round-1 MEDIUM — `<dd>before<pre>code</pre>after</dd>` would otherwise
+/// span [before_start, after_end) and violate invariant 4).
+dom.Element? findDtDdAncestor(dom.Node? node) {
+  var cur = node;
+  while (cur != null) {
+    if (cur is dom.Element) {
+      final tag = cur.localName?.toLowerCase();
+      if (tag == 'dt' || tag == 'dd') return cur;
+      if (isBlockElement(cur)) return null;
+    }
+    cur = cur.parent;
+  }
+  return null;
 }
 
 /// Get next node in document order (depth-first traversal).
@@ -620,6 +697,45 @@ class _PreserveSpan {
   const _PreserveSpan(this.element, this.startPos);
 }
 
+/// Frame for a single `<li>` element. Tracks an in-progress slice (for the
+/// current direct-text run) and the list of completed slices already
+/// closed for this `<li>`. Plan §5.8: an `<li>` may have multiple slices
+/// when nested `<ul>` / `<ol>` children break up its direct text.
+class _ListItemFrame {
+  /// Buffer position where the currently-open slice started, or null if
+  /// no slice is currently open. A slice opens lazily on the first
+  /// [_StructuredEmitter.writeText] call after [_StructuredEmitter.syncDirectLi]
+  /// transitions into this `<li>` — that defers slice-start past any
+  /// intermediate block-separator writes.
+  int? openStart;
+
+  /// True iff the slice should open at the next [_StructuredEmitter.writeText].
+  /// Set on entering or re-entering this `<li>`; cleared once the slice opens.
+  bool pendingOpen = false;
+
+  /// True iff any non-whitespace character has been written into the
+  /// currently-open slice. Whitespace-only slices are NOT recorded — they
+  /// would otherwise mislead the builder's slice-pop walker on
+  /// pretty-printed input like `<li>\n<ul>...</ul>\ntail</li>` (codex
+  /// round-1 HIGH: leading-newline text node would steal the tail slice).
+  bool sliceHasNonWs = false;
+
+  final List<TextRange> ranges = [];
+}
+
+/// Frame for a single `<dt>` or `<dd>` element. Records at most one range
+/// (the FIRST contiguous direct-text slice). Subsequent slices — created
+/// when a block descendant like `<pre>` shadows the dt/dd — are dropped to
+/// keep the recorded range from straddling a preserved boundary (codex
+/// round-1 MEDIUM). The trailing text becomes orphan plain text in v1.1;
+/// supporting multi-range definitionItem bodies is deferred to v2.
+class _DtDdFrame {
+  int? openStart;
+  bool pendingOpen = false;
+  bool sliceHasNonWs = false;
+  TextRange? range;
+}
+
 /// Emits text into a [StringBuffer] while tracking preserved ranges
 /// (for `<pre>`) and element ranges (for `<figcaption>` in v1.0; lists,
 /// tables, dl items in v1.1/v1.2).
@@ -637,12 +753,69 @@ class _StructuredEmitter {
   // Single open figcaption span (figcaptions are not nested in practice).
   _PreserveSpan? _figcaptionSpan;
 
+  // <li> slice tracking (plan §5.8). Lazy frame allocation per <li> on first
+  // [syncDirectLi]. Only one <li>'s slice can be in "pending open" state at
+  // a time (sync transitions enforce this — entering a new li always closes
+  // the prior one's pending state via close-slice).
+  final Map<dom.Element, _ListItemFrame> _liFrames = {};
+  dom.Element? _currentDirectLi;
+  // Element whose frame should open a slice at the next text write.
+  dom.Element? _pendingOpenLi;
+
+  // <dt>/<dd> single-range tracking. Same lazy / pending semantics as <li>.
+  final Map<dom.Element, _DtDdFrame> _dtDdFrames = {};
+  dom.Element? _currentDtDd;
+  dom.Element? _pendingOpenDtDd;
+
   bool get _inPreserveMode => _preserveStack.isNotEmpty;
 
   String get text => _buffer.toString();
 
   void writeText(String text) {
     if (text.isEmpty) return;
+    // Open any pending slice BEFORE the text is appended, so the slice
+    // start lands exactly on the first character of this text run.
+    if (_pendingOpenLi != null) {
+      final frame = _liFrames.putIfAbsent(
+        _pendingOpenLi!,
+        () => _ListItemFrame(),
+      );
+      frame.openStart = _buffer.length;
+      frame.sliceHasNonWs = false;
+      frame.pendingOpen = false;
+      _pendingOpenLi = null;
+    }
+    if (_pendingOpenDtDd != null) {
+      final frame = _dtDdFrames.putIfAbsent(
+        _pendingOpenDtDd!,
+        () => _DtDdFrame(),
+      );
+      // Only set openStart once — the very first writeText after enter.
+      // Subsequent writes leave it untouched so the range covers all text.
+      frame.openStart ??= _buffer.length;
+      frame.pendingOpen = false;
+      _pendingOpenDtDd = null;
+    }
+
+    // Track whether this text run has any non-whitespace characters. Used
+    // by [_closeLiSlice] / [_closeDtDdSlice] to drop whitespace-only
+    // slices (codex round-1 HIGH).
+    final textHasNonWs = _hasAsciiNonWs(text);
+    if (textHasNonWs) {
+      if (_currentDirectLi != null) {
+        final frame = _liFrames[_currentDirectLi];
+        if (frame != null && frame.openStart != null) {
+          frame.sliceHasNonWs = true;
+        }
+      }
+      if (_currentDtDd != null) {
+        final frame = _dtDdFrames[_currentDtDd];
+        if (frame != null && frame.openStart != null) {
+          frame.sliceHasNonWs = true;
+        }
+      }
+    }
+
     if (_inPreserveMode) {
       // Preserve verbatim, with tab→4-space normalisation and \r dropped.
       // Plan §5.3.
@@ -652,6 +825,14 @@ class _StructuredEmitter {
     } else {
       _buffer.write(text);
     }
+  }
+
+  static bool _hasAsciiNonWs(String s) {
+    for (var i = 0; i < s.length; i++) {
+      final c = s.codeUnitAt(i);
+      if (c != 0x20 && c != 0x09 && c != 0x0A && c != 0x0D) return true;
+    }
+    return false;
   }
 
   void writeBlockSeparator() {
@@ -665,6 +846,73 @@ class _StructuredEmitter {
 
   void writeLineBreak() {
     _buffer.write('\n');
+  }
+
+  /// Update the closest-`<li>` ancestor tracker. Called by both walkers
+  /// before processing each node. On transition: close the previous `<li>`'s
+  /// open slice (if any), and queue a "pending open" on the new `<li>` so
+  /// its slice opens precisely at the next [writeText] (skipping any
+  /// intermediate block separators).
+  void syncDirectLi(dom.Element? newLi) {
+    if (identical(newLi, _currentDirectLi)) return;
+    final prev = _currentDirectLi;
+    if (prev != null) {
+      final frame = _liFrames[prev];
+      if (frame != null) _closeLiSlice(frame);
+    }
+    // Cancel any prior pending-open that hasn't fired yet — the slice never
+    // got real text, so there's nothing to record.
+    _pendingOpenLi = newLi;
+    _currentDirectLi = newLi;
+    if (newLi != null) {
+      final frame = _liFrames.putIfAbsent(newLi, () => _ListItemFrame());
+      frame.pendingOpen = true;
+    }
+  }
+
+  /// Update the closest-`<dt>`/`<dd>` ancestor tracker. Same semantics as
+  /// [syncDirectLi] but records a single (start, end) per element.
+  void syncDtDd(dom.Element? newDtDd) {
+    if (identical(newDtDd, _currentDtDd)) return;
+    final prev = _currentDtDd;
+    if (prev != null) {
+      final frame = _dtDdFrames[prev];
+      if (frame != null) _closeDtDdSlice(frame);
+    }
+    _pendingOpenDtDd = newDtDd;
+    _currentDtDd = newDtDd;
+    if (newDtDd != null) {
+      final frame = _dtDdFrames.putIfAbsent(newDtDd, () => _DtDdFrame());
+      frame.pendingOpen = true;
+    }
+  }
+
+  void _closeLiSlice(_ListItemFrame frame) {
+    if (frame.openStart != null) {
+      if (_buffer.length > frame.openStart! && frame.sliceHasNonWs) {
+        frame.ranges.add(TextRange(frame.openStart!, _buffer.length));
+      }
+      frame.openStart = null;
+      frame.sliceHasNonWs = false;
+    }
+    frame.pendingOpen = false;
+  }
+
+  void _closeDtDdSlice(_DtDdFrame frame) {
+    if (frame.openStart != null) {
+      if (_buffer.length > frame.openStart! && frame.sliceHasNonWs) {
+        // Record the FIRST contiguous direct-text slice only. Subsequent
+        // slices (created when a block descendant like <pre> shadows the
+        // dt/dd) are dropped — combining them would produce a range that
+        // straddles the preserved boundary, violating the ExtractedText
+        // invariant 4 (codex round-1 MEDIUM). Multi-range definitionItem
+        // bodies are deferred to v2.
+        frame.range ??= TextRange(frame.openStart!, _buffer.length);
+      }
+      frame.openStart = null;
+      frame.sliceHasNonWs = false;
+    }
+    frame.pendingOpen = false;
   }
 
   void enterPreserve(dom.Element element) {
@@ -729,6 +977,36 @@ class _StructuredEmitter {
   /// must pass the [document] used for parsing — it's the source of truth
   /// for element identity.
   ExtractedText toExtractedText(dom.Document document) {
+    // Finalise any still-open <li> / <dt> / <dd> slices. Defensive: the
+    // walker's last sync(null) at end-of-section normally closes everything,
+    // but in pathological mid-element termination we still need to cap.
+    if (_currentDirectLi != null) {
+      final frame = _liFrames[_currentDirectLi];
+      if (frame != null) _closeLiSlice(frame);
+      _currentDirectLi = null;
+      _pendingOpenLi = null;
+    }
+    if (_currentDtDd != null) {
+      final frame = _dtDdFrames[_currentDtDd];
+      if (frame != null) _closeDtDdSlice(frame);
+      _currentDtDd = null;
+      _pendingOpenDtDd = null;
+    }
+
+    // Populate elementRanges for tracked <li>s and dt/dds. Skip empty
+    // frames so we don't pollute the map with no-op entries.
+    for (final entry in _liFrames.entries) {
+      if (entry.value.ranges.isNotEmpty) {
+        _elementRanges[entry.key] = List.of(entry.value.ranges);
+      }
+    }
+    for (final entry in _dtDdFrames.entries) {
+      final r = entry.value.range;
+      if (r != null && !r.isEmpty) {
+        _elementRanges[entry.key] = [r];
+      }
+    }
+
     // Drop any zero-length preserved ranges defensively (shouldn't happen).
     final preserved = _preservedRanges.where((r) => !r.isEmpty).toList();
     return ExtractedText(

@@ -255,13 +255,152 @@ class TextCleaner {
     return s.replaceAll('\t', '    ').replaceAll('\r', '');
   }
 
-  /// Greedy diff producing a coarse edit script for two strings. Used by
-  /// [_applyFixPdfLineBreaks] only (where precise per-rule tracking would
-  /// duplicate the rule logic).
+  /// Diff producing an edit script for two strings.
+  ///
+  /// Uses **token-aligned diff**: tokenise both strings on whitespace
+  /// boundaries; if both produce the same number of non-whitespace tokens,
+  /// emit one edit per token + one edit per inter-token whitespace gap.
+  /// This gives fine-grained offset translation — important for v1.1+ where
+  /// `<li>` / `<dt>` / `<dd>` ranges land at non-preserved positions and the
+  /// coarse 3-edit diff would map them all to the same boundary.
+  ///
+  /// Falls back to coarse prefix/suffix diff when token counts differ
+  /// (e.g. `fixPdfLineBreaks` merged "po-\nkojowo" into "pokojowo"),
+  /// preserving previous offset-translation precision in those cases.
   static EditScript _diffEditScript(String a, String b) {
-    // Find longest common prefix and suffix; treat the middle as one
-    // Replace edit. This is coarse but sufficient for offset translation
-    // outside preserved ranges (plan §5.4 caveat).
+    if (a == b) {
+      final edits = a.isEmpty
+          ? const <Edit>[]
+          : <Edit>[
+              Keep(inputStart: 0, inputEnd: a.length, outputStart: 0),
+            ];
+      return EditScript(
+        edits: edits,
+        originalLength: a.length,
+        outputLength: b.length,
+      );
+    }
+
+    final aTokens = _tokenizeOnWhitespace(a);
+    final bTokens = _tokenizeOnWhitespace(b);
+    if (aTokens.length == bTokens.length && aTokens.isNotEmpty) {
+      final aligned = _tokenAlignedDiff(a, b, aTokens, bTokens);
+      if (aligned != null) return aligned;
+    }
+    return _coarsePrefixSuffixDiff(a, b);
+  }
+
+  /// Tokenise [s] into half-open `[start, end)` ranges of contiguous
+  /// non-whitespace runs. Whitespace = ` `, `\t`, `\n`, `\r`. Returns each
+  /// token as a 2-element list `[start, end]`.
+  static List<List<int>> _tokenizeOnWhitespace(String s) {
+    final tokens = <List<int>>[];
+    var i = 0;
+    while (i < s.length) {
+      final c = s.codeUnitAt(i);
+      if (!_isAsciiWs(c)) {
+        final start = i;
+        while (i < s.length && !_isAsciiWs(s.codeUnitAt(i))) {
+          i++;
+        }
+        tokens.add([start, i]);
+      } else {
+        i++;
+      }
+    }
+    return tokens;
+  }
+
+  static bool _isAsciiWs(int c) {
+    return c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D;
+  }
+
+  /// Token-aligned diff. Assumes [aTokens.length] == [bTokens.length].
+  /// Emits per-token + per-gap edits in input order. Returns null if a
+  /// pure-insertion gap (input empty, output non-empty) is required —
+  /// the [Edit] alphabet can't represent that, so the caller falls back
+  /// to the coarse diff which represents it as a single combined Replace.
+  static EditScript? _tokenAlignedDiff(
+    String a,
+    String b,
+    List<List<int>> aTokens,
+    List<List<int>> bTokens,
+  ) {
+    final edits = <Edit>[];
+    var prevA = 0;
+    var prevB = 0;
+
+    bool emitGap(int aStart, int bStart) {
+      if (aStart == prevA && bStart == prevB) return true; // empty
+      final aGap = a.substring(prevA, aStart);
+      final bGap = b.substring(prevB, bStart);
+      if (aGap == bGap) {
+        if (aStart > prevA) {
+          edits.add(
+            Keep(inputStart: prevA, inputEnd: aStart, outputStart: prevB),
+          );
+        }
+        return true;
+      }
+      if (aStart > prevA) {
+        if (bStart > prevB) {
+          edits.add(
+            Replace(
+              inputStart: prevA,
+              inputEnd: aStart,
+              outputStart: prevB,
+              replacement: bGap,
+            ),
+          );
+        } else {
+          edits.add(
+            Delete(inputStart: prevA, inputEnd: aStart, outputStart: prevB),
+          );
+        }
+        return true;
+      }
+      // Pure insertion (input empty, output non-empty) — Edit alphabet
+      // can't represent this. Caller falls back to coarse diff.
+      return false;
+    }
+
+    for (var k = 0; k < aTokens.length; k++) {
+      final aStart = aTokens[k][0];
+      final aEnd = aTokens[k][1];
+      final bStart = bTokens[k][0];
+      final bEnd = bTokens[k][1];
+      if (!emitGap(aStart, bStart)) return null;
+      final aTok = a.substring(aStart, aEnd);
+      final bTok = b.substring(bStart, bEnd);
+      if (aTok == bTok) {
+        edits.add(
+          Keep(inputStart: aStart, inputEnd: aEnd, outputStart: bStart),
+        );
+      } else {
+        edits.add(
+          Replace(
+            inputStart: aStart,
+            inputEnd: aEnd,
+            outputStart: bStart,
+            replacement: bTok,
+          ),
+        );
+      }
+      prevA = aEnd;
+      prevB = bEnd;
+    }
+    if (!emitGap(a.length, b.length)) return null;
+    return EditScript(
+      edits: edits,
+      originalLength: a.length,
+      outputLength: b.length,
+    );
+  }
+
+  /// Coarse fallback: longest common prefix + suffix, single Replace/Delete
+  /// in the middle. Used when token-aligned diff can't represent an edit
+  /// (pure insertion) or when token counts mismatch.
+  static EditScript _coarsePrefixSuffixDiff(String a, String b) {
     var prefix = 0;
     final maxPrefix = a.length < b.length ? a.length : b.length;
     while (prefix < maxPrefix && a.codeUnitAt(prefix) == b.codeUnitAt(prefix)) {
@@ -305,9 +444,14 @@ class TextCleaner {
         );
         outCursor += replacementMid.length;
       } else {
-        // Pure insertion — the input range is empty. We can't represent
-        // this as an Edit over the input alphabet, so skip (downstream
-        // offset translation is approximate here).
+        // Pure insertion (input range empty, output non-empty). The Edit
+        // alphabet can't represent this as a standalone edit, but we MUST
+        // still advance outCursor so the trailing-suffix Keep's
+        // outputStart accounts for the inserted text (codex round-1
+        // MEDIUM — without this advance, the suffix Keep starts at the
+        // wrong output offset, breaking mapStart/mapEnd for any input
+        // position past the insertion point).
+        outCursor += replacementMid.length;
       }
     }
     if (suffixA < a.length) {
