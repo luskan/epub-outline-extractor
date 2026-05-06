@@ -184,11 +184,14 @@ ExtractedText extractStructured(String htmlContent) {
   if (body != null) {
     _walkAll(body, emitter);
   }
-  // Symmetry with the linear walkers: explicitly close any open li/dt/dd
-  // state. toExtractedText also defensively cleans up, but doing it here
-  // keeps the emitter's lifecycle consistent across all extraction paths.
+  // Symmetry with the linear walkers: explicitly close any open
+  // li/dt/dd/table/caption state. toExtractedText also defensively
+  // cleans up, but doing it here keeps the emitter's lifecycle
+  // consistent across all extraction paths.
   emitter.syncDirectLi(null);
   emitter.syncDtDd(null);
+  emitter.syncTable(null);
+  emitter.syncCaption(null);
   return emitter.toExtractedText(document);
 }
 
@@ -203,6 +206,8 @@ void _walkAll(dom.Node root, _StructuredEmitter emitter) {
   // of inter-block whitespace.
   emitter.syncDirectLi(findDirectLi(root));
   emitter.syncDtDd(findDtDdAncestor(root));
+  emitter.syncTable(findTableAncestor(root));
+  emitter.syncCaption(findCaptionAncestor(root));
 
   if (root is dom.Text) {
     emitter.writeText(root.text);
@@ -284,12 +289,15 @@ void _extractUntilElement(
       return;
     }
 
-    // Sync li/dtdd ancestor state so v1.1 list/dl tracking fires for
-    // sections extracted via the no-fragment-id-but-end-fragment path
-    // (codex round-1 MEDIUM: previously this walker skipped sync, leaving
-    // leading sections without listItem / definitionItem blocks).
+    // Sync li/dtdd/table/caption ancestor state so v1.1/v1.2 tracking
+    // fires for sections extracted via the no-fragment-id-but-end-fragment
+    // path (codex round-1 MEDIUM: previously this walker skipped sync,
+    // leaving leading sections without listItem / definitionItem /
+    // table / caption blocks).
     emitter.syncDirectLi(findDirectLi(node));
     emitter.syncDtDd(findDtDdAncestor(node));
+    emitter.syncTable(findTableAncestor(node));
+    emitter.syncCaption(findCaptionAncestor(node));
 
     if (node.nodeType == dom.Node.TEXT_NODE) {
       emitter.writeText(node.text ?? '');
@@ -327,9 +335,11 @@ void _extractUntilElement(
   }
 
   walkNodes(document);
-  // Close any still-open li / dt-dd state at end of walk.
+  // Close any still-open li / dt-dd / table / caption state at end of walk.
   emitter.syncDirectLi(null);
   emitter.syncDtDd(null);
+  emitter.syncTable(null);
+  emitter.syncCaption(null);
 }
 
 /// Internal: extract text walking from a starting element until the next
@@ -418,6 +428,8 @@ void _extractFromElement(
     }
     emitter.syncDirectLi(findDirectLi(node));
     emitter.syncDtDd(findDtDdAncestor(node));
+    emitter.syncTable(findTableAncestor(node));
+    emitter.syncCaption(findCaptionAncestor(node));
   }
 
   dom.Node? current = actualStart;
@@ -502,6 +514,60 @@ dom.Element? findDirectLi(dom.Node? node) {
     if (cur is dom.Element) {
       final tag = cur.localName?.toLowerCase();
       if (tag == 'li') return cur;
+      if (isBlockElement(cur)) return null;
+    }
+    cur = cur.parent;
+  }
+  return null;
+}
+
+/// Walking up from [node], return the OUTERMOST `<table>` ancestor whose
+/// body content [node] contributes to. Plan §5.10.
+///
+/// Caption shadowing is restricted to the OUTERMOST table's own caption
+/// (codex round-2 v1.2 MEDIUM): a nested table's caption belongs inside
+/// the outer table's body content (it's flattened into the outer cell's
+/// text via `cell.text`), so attributing it to null would leave the
+/// outer's recorded range short and create duplicate-render artefacts.
+/// We only shadow when the caption ancestor is a direct child of the
+/// outermost table found.
+///
+/// Walks past inner `<table>` elements to find the outermost: nested
+/// tables are flattened into the outer table's cell text, and the builder
+/// skips emitting separate table blocks for nested tables.
+dom.Element? findTableAncestor(dom.Node? node) {
+  var cur = node;
+  dom.Element? outermost;
+  dom.Element? captionAncestor;
+  while (cur != null) {
+    if (cur is dom.Element) {
+      final tag = cur.localName?.toLowerCase();
+      if (tag == 'caption') {
+        captionAncestor = cur;
+      } else if (tag == 'table') {
+        outermost = cur;
+        // Don't return early — keep walking to find the outermost.
+      }
+    }
+    cur = cur.parent;
+  }
+  if (outermost == null) return null;
+  // Shadow only when caption is the outermost table's own direct child.
+  if (captionAncestor != null && captionAncestor.parent == outermost) {
+    return null;
+  }
+  return outermost;
+}
+
+/// Walking up from [node], return the closest `<caption>` ancestor.
+/// Block elements other than `<caption>` shadow (mirrors [findDirectLi]
+/// rule for safety).
+dom.Element? findCaptionAncestor(dom.Node? node) {
+  var cur = node;
+  while (cur != null) {
+    if (cur is dom.Element) {
+      final tag = cur.localName?.toLowerCase();
+      if (tag == 'caption') return cur;
       if (isBlockElement(cur)) return null;
     }
     cur = cur.parent;
@@ -723,6 +789,29 @@ class _ListItemFrame {
   final List<TextRange> ranges = [];
 }
 
+/// Frame for a single `<table>` element (v1.2). Records a single range
+/// covering the table's body content (excludes outermost-own `<caption>`
+/// text). When a caption sits BETWEEN row groups, slices fragment around
+/// the caption shadow; close-slice unions them so the recorded range
+/// covers the full body extent. Defensively falls back when the union
+/// would straddle a `<pre>` preserved range inside the table.
+class _TableFrame {
+  int? openStart;
+  bool pendingOpen = false;
+  bool sliceHasNonWs = false;
+  TextRange? range;
+}
+
+/// Frame for a single `<caption>` element (v1.2). Same shape as
+/// [_TableFrame]; recorded separately so the builder can emit a caption
+/// block (italic-marked paragraph) before the table block in DOM order.
+class _CaptionFrame {
+  int? openStart;
+  bool pendingOpen = false;
+  bool sliceHasNonWs = false;
+  TextRange? range;
+}
+
 /// Frame for a single `<dt>` or `<dd>` element. Records at most one range
 /// (the FIRST contiguous direct-text slice). Subsequent slices — created
 /// when a block descendant like `<pre>` shadows the dt/dd — are dropped to
@@ -767,6 +856,19 @@ class _StructuredEmitter {
   dom.Element? _currentDtDd;
   dom.Element? _pendingOpenDtDd;
 
+  // <table>/<caption> tracking (v1.2). Caption records a single
+  // first-slice range. Table records a union over its body slices
+  // (slices fragment when a `<caption>` shadows mid-walk; the union
+  // covers the full body extent). The table's range explicitly EXCLUDES
+  // outermost-own caption text (plan §5.10 — findTableAncestor shadows
+  // when caption is the outermost table's direct child).
+  final Map<dom.Element, _TableFrame> _tableFrames = {};
+  dom.Element? _currentTable;
+  dom.Element? _pendingOpenTable;
+  final Map<dom.Element, _CaptionFrame> _captionFrames = {};
+  dom.Element? _currentCaption;
+  dom.Element? _pendingOpenCaption;
+
   bool get _inPreserveMode => _preserveStack.isNotEmpty;
 
   String get text => _buffer.toString();
@@ -796,6 +898,24 @@ class _StructuredEmitter {
       frame.pendingOpen = false;
       _pendingOpenDtDd = null;
     }
+    if (_pendingOpenTable != null) {
+      final frame = _tableFrames.putIfAbsent(
+        _pendingOpenTable!,
+        () => _TableFrame(),
+      );
+      frame.openStart ??= _buffer.length;
+      frame.pendingOpen = false;
+      _pendingOpenTable = null;
+    }
+    if (_pendingOpenCaption != null) {
+      final frame = _captionFrames.putIfAbsent(
+        _pendingOpenCaption!,
+        () => _CaptionFrame(),
+      );
+      frame.openStart ??= _buffer.length;
+      frame.pendingOpen = false;
+      _pendingOpenCaption = null;
+    }
 
     // Track whether this text run has any non-whitespace characters. Used
     // by [_closeLiSlice] / [_closeDtDdSlice] to drop whitespace-only
@@ -810,6 +930,18 @@ class _StructuredEmitter {
       }
       if (_currentDtDd != null) {
         final frame = _dtDdFrames[_currentDtDd];
+        if (frame != null && frame.openStart != null) {
+          frame.sliceHasNonWs = true;
+        }
+      }
+      if (_currentTable != null) {
+        final frame = _tableFrames[_currentTable];
+        if (frame != null && frame.openStart != null) {
+          frame.sliceHasNonWs = true;
+        }
+      }
+      if (_currentCaption != null) {
+        final frame = _captionFrames[_currentCaption];
         if (frame != null && frame.openStart != null) {
           frame.sliceHasNonWs = true;
         }
@@ -915,6 +1047,106 @@ class _StructuredEmitter {
     frame.pendingOpen = false;
   }
 
+  /// v1.2: sync the closest `<table>` ancestor. Same lazy/pending
+  /// semantics as [syncDirectLi]. Body-content slices union via
+  /// [_closeTableSlice] so the recorded range covers the full body
+  /// extent even when a `<caption>` fragments the walk; caption text
+  /// is recorded separately via [syncCaption].
+  void syncTable(dom.Element? newTable) {
+    if (identical(newTable, _currentTable)) return;
+    final prev = _currentTable;
+    if (prev != null) {
+      final frame = _tableFrames[prev];
+      if (frame != null) _closeTableSlice(frame);
+    }
+    _pendingOpenTable = newTable;
+    _currentTable = newTable;
+    if (newTable != null) {
+      final frame = _tableFrames.putIfAbsent(newTable, () => _TableFrame());
+      frame.pendingOpen = true;
+    }
+  }
+
+  /// v1.2: sync the closest `<caption>` ancestor.
+  void syncCaption(dom.Element? newCaption) {
+    if (identical(newCaption, _currentCaption)) return;
+    final prev = _currentCaption;
+    if (prev != null) {
+      final frame = _captionFrames[prev];
+      if (frame != null) _closeCaptionSlice(frame);
+    }
+    _pendingOpenCaption = newCaption;
+    _currentCaption = newCaption;
+    if (newCaption != null) {
+      final frame =
+          _captionFrames.putIfAbsent(newCaption, () => _CaptionFrame());
+      frame.pendingOpen = true;
+    }
+  }
+
+  void _closeTableSlice(_TableFrame frame) {
+    if (frame.openStart != null) {
+      if (_buffer.length > frame.openStart! && frame.sliceHasNonWs) {
+        final newStart = frame.openStart!;
+        final newEnd = _buffer.length;
+        final slice = TextRange(newStart, newEnd);
+        final existing = frame.range;
+        // Union with any prior slice — covers the case where a `<caption>`
+        // sits between row groups (codex round-final HIGH for v1.2). The
+        // table block's range must cover all body text so the renderer
+        // doesn't emit later rows as gap text and duplicate them.
+        final unioned = existing == null
+            ? slice
+            : TextRange(
+                existing.start < newStart ? existing.start : newStart,
+                existing.end > newEnd ? existing.end : newEnd,
+              );
+        // Preserve the §5.2 invariant 4 (no straddling of preserved
+        // ranges): if expanding the range would straddle a `<pre>`
+        // preserved range inside the table, fall back to a non-straddling
+        // option. If the new slice itself straddles too, leave the range
+        // unset (no elementRange recorded → builder skips the table block
+        // entirely, but cells' text is still in plainText). Tables
+        // containing `<pre>` cells are an acknowledged v1.2 limit; cpp20
+        // doesn't hit this.
+        if (!_rangeStraddlesPreserved(unioned)) {
+          frame.range = unioned;
+        } else if (existing != null) {
+          // Keep existing — already known non-straddling from prior close.
+        } else if (!_rangeStraddlesPreserved(slice)) {
+          frame.range = slice;
+        }
+        // else: leave frame.range null; the builder will skip the table.
+      }
+      frame.openStart = null;
+      frame.sliceHasNonWs = false;
+    }
+    frame.pendingOpen = false;
+  }
+
+  bool _rangeStraddlesPreserved(TextRange r) {
+    if (r.isEmpty) return false;
+    for (final p in _preservedRanges) {
+      if (p.end <= r.start) continue;
+      if (p.start >= r.end) return false;
+      final fullyInside = r.start >= p.start && r.end <= p.end;
+      if (!fullyInside) return true;
+      return false;
+    }
+    return false;
+  }
+
+  void _closeCaptionSlice(_CaptionFrame frame) {
+    if (frame.openStart != null) {
+      if (_buffer.length > frame.openStart! && frame.sliceHasNonWs) {
+        frame.range ??= TextRange(frame.openStart!, _buffer.length);
+      }
+      frame.openStart = null;
+      frame.sliceHasNonWs = false;
+    }
+    frame.pendingOpen = false;
+  }
+
   void enterPreserve(dom.Element element) {
     _preserveStack.add(_PreserveSpan(element, _buffer.length));
   }
@@ -992,6 +1224,18 @@ class _StructuredEmitter {
       _currentDtDd = null;
       _pendingOpenDtDd = null;
     }
+    if (_currentTable != null) {
+      final frame = _tableFrames[_currentTable];
+      if (frame != null) _closeTableSlice(frame);
+      _currentTable = null;
+      _pendingOpenTable = null;
+    }
+    if (_currentCaption != null) {
+      final frame = _captionFrames[_currentCaption];
+      if (frame != null) _closeCaptionSlice(frame);
+      _currentCaption = null;
+      _pendingOpenCaption = null;
+    }
 
     // Populate elementRanges for tracked <li>s and dt/dds. Skip empty
     // frames so we don't pollute the map with no-op entries.
@@ -1001,6 +1245,18 @@ class _StructuredEmitter {
       }
     }
     for (final entry in _dtDdFrames.entries) {
+      final r = entry.value.range;
+      if (r != null && !r.isEmpty) {
+        _elementRanges[entry.key] = [r];
+      }
+    }
+    for (final entry in _tableFrames.entries) {
+      final r = entry.value.range;
+      if (r != null && !r.isEmpty) {
+        _elementRanges[entry.key] = [r];
+      }
+    }
+    for (final entry in _captionFrames.entries) {
       final r = entry.value.range;
       if (r != null && !r.isEmpty) {
         _elementRanges[entry.key] = [r];

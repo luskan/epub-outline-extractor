@@ -762,6 +762,480 @@ void main() {
       expect(paragraphs.length, greaterThanOrEqualTo(2));
     });
 
+    test('basic table emits one table block with tableRows', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<table><thead><tr><th>H1</th></tr></thead>'
+          '<tbody><tr><td>D1</td></tr></tbody></table>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final tables =
+          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      expect(tables, hasLength(1));
+      expect(tables.single.tableRows, [
+        ['H1'],
+        ['D1'],
+      ]);
+    });
+
+    test('table with caption emits italic caption block BEFORE table block',
+        () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<table><caption>Cap text</caption>'
+          '<tbody><tr><td>cell</td></tr></tbody></table>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final captions = blocks
+          .where(
+            (b) =>
+                b.type == ContentBlockType.paragraph &&
+                b.marks.any(
+                  (m) =>
+                      m.type == InlineMarkType.emphasis &&
+                      m.style == 'italic',
+                ),
+          )
+          .toList();
+      final tables =
+          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      expect(captions, hasLength(1));
+      expect(tables, hasLength(1));
+      // Caption before table in DOM order; ranges disjoint.
+      expect(captions.single.end, lessThanOrEqualTo(tables.single.start));
+    });
+
+    test('table caption text and body text appear at disjoint ranges', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<table><caption>cap</caption>'
+          '<tbody><tr><td>x</td></tr></tbody></table>'
+          '</body></html>';
+      final raw = extractStructured(html);
+      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
+      final extraction = SectionExtraction(
+        extracted: cleaned,
+        sectionStartElement: null,
+        sectionEndElement: null,
+      );
+      final json = EpubStructuredContentBuilder.build(extraction);
+      final parsed = StructuredContent.tryParse(json);
+      final caption = parsed!.annotations.firstWhere(
+        (b) => b.marks.any(
+          (m) => m.type == InlineMarkType.emphasis && m.style == 'italic',
+        ),
+      );
+      final table = parsed.annotations.firstWhere(
+        (b) => b.type == ContentBlockType.table,
+      );
+      // Caption substring is "cap"; table substring contains "x".
+      expect(cleaned.text.substring(caption.start, caption.end), 'cap');
+      // Caption's range and table's range are non-overlapping.
+      expect(caption.end, lessThanOrEqualTo(table.start));
+    });
+
+    test('bare <tr> children (no <tbody>) still extract rows', () {
+      // package:html parser typically inserts an implicit <tbody>, but we
+      // walk both wrapped and bare tr's defensively (plan §5.10).
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<table><tr><th>A</th><th>B</th></tr>'
+          '<tr><td>1</td><td>2</td></tr></table>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final tables =
+          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      expect(tables, hasLength(1));
+      expect(tables.single.tableRows, [
+        ['A', 'B'],
+        ['1', '2'],
+      ]);
+    });
+
+    test('empty first cell in table preserves row structure', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<table><tr><th></th><th>A</th></tr>'
+          '<tr><td></td><td>1</td></tr></table>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final tables =
+          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      expect(tables, hasLength(1));
+      expect(tables.single.tableRows, [
+        ['', 'A'],
+        ['', '1'],
+      ]);
+    });
+
+    test('repeated cell content (different rows, same text) emits once per '
+        'row', () {
+      // cpp20 iterator-categories pattern: same cell content in multiple
+      // rows. Element-identity anchoring avoids offset confusion.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<table><tr><td>same</td></tr>'
+          '<tr><td>same</td></tr>'
+          '<tr><td>same</td></tr></table>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final tables =
+          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      expect(tables, hasLength(1));
+      expect(tables.single.tableRows, [
+        ['same'],
+        ['same'],
+        ['same'],
+      ]);
+    });
+
+    test('malformed table with no rows emits no table block (claim+skip)',
+        () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<table></table>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final tables =
+          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      expect(tables, isEmpty);
+    });
+
+    test('table with caption and whitespace between caption and tbody', () {
+      // Pretty-printed input: whitespace text node between </caption> and
+      // <tbody>. The caption's range and the table's body range must not
+      // straddle that whitespace.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<table>'
+          '<caption>cap</caption>\n  '
+          '<tbody><tr><td>x</td></tr></tbody>'
+          '</table>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final captions = blocks
+          .where(
+            (b) =>
+                b.type == ContentBlockType.paragraph &&
+                b.marks.any(
+                  (m) =>
+                      m.type == InlineMarkType.emphasis &&
+                      m.style == 'italic',
+                ),
+          )
+          .toList();
+      final tables =
+          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      expect(captions, hasLength(1));
+      expect(tables, hasLength(1));
+      expect(captions.single.end, lessThanOrEqualTo(tables.single.start));
+    });
+
+    test('nested tables flatten — inner table emits no separate block',
+        () {
+      // Codex round-1 v1.2 MEDIUM: previously, inner table emitted as a
+      // separate block AND outer's cell.text included inner content,
+      // causing visual duplication. With flattening, only the outer
+      // table emits; inner content is part of the outer cell.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<table><tbody><tr><td>'
+          '<table><tbody><tr><td>inner</td></tr></tbody></table>'
+          '</td></tr></tbody></table>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final tables =
+          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      expect(tables, hasLength(1));
+      // Outer table's single cell contains "inner" via cell.text.
+      expect(tables.single.tableRows, [
+        ['inner'],
+      ]);
+    });
+
+    test('nested table caption flattens into outer cell (no duplicate '
+        'render)', () {
+      // Codex round-2 v1.2 MEDIUM: inner-table caption was shadowing
+      // outer's table range, leaving "inner cap" both in cell.text AND
+      // as uncovered gap text. Fix: only outermost-own caption shadows;
+      // nested table captions remain inside the outer table's body range.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<table><tbody><tr><td>'
+          '<table><caption>inner cap</caption>'
+          '<tbody><tr><td>x</td></tr></tbody></table>'
+          '</td></tr></tbody></table>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final tables =
+          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      final captions = blocks
+          .where(
+            (b) =>
+                b.type == ContentBlockType.paragraph &&
+                b.marks.any(
+                  (m) =>
+                      m.type == InlineMarkType.emphasis &&
+                      m.style == 'italic',
+                ),
+          )
+          .toList();
+      // Only ONE table block (outer); inner table is skipped.
+      expect(tables, hasLength(1));
+      // No standalone caption blocks — inner caption is part of outer
+      // cell text via flattening; no caption block emits.
+      expect(captions, isEmpty);
+      // Outer's cell text includes both "inner cap" and "x".
+      expect(tables.single.tableRows, hasLength(1));
+      final cellText = tables.single.tableRows!.single.single;
+      expect(cellText, contains('inner cap'));
+      expect(cellText, contains('x'));
+
+      // Tighter regression: outer table's annotation range covers the
+      // "inner cap" text in plainText, confirming the inner caption is
+      // attributed to the outer table's body range (not shadowed).
+      final raw = extractStructured(html);
+      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
+      final extraction = SectionExtraction(
+        extracted: cleaned,
+        sectionStartElement: null,
+        sectionEndElement: null,
+      );
+      final json = EpubStructuredContentBuilder.build(extraction);
+      final parsed = StructuredContent.tryParse(json);
+      final outerTable = parsed!.annotations.firstWhere(
+        (b) => b.type == ContentBlockType.table,
+      );
+      final outerSubstring =
+          cleaned.text.substring(outerTable.start, outerTable.end);
+      expect(outerSubstring, contains('inner cap'));
+    });
+
+    test('caption AFTER rows (malformed HTML) still emits both blocks in '
+        'plain-text DOM order', () {
+      // Senior round-final LOW-1: package:html doesn't normalise caption
+      // position. With caption after tbody in DOM, table.start < caption.start;
+      // the builder must emit table first (otherwise searchFrom advances
+      // past caption and the table block is claim+skipped).
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<table><tbody><tr><td>cell</td></tr></tbody>'
+          '<caption>cap</caption></table>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final tables =
+          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      final captions = blocks
+          .where(
+            (b) =>
+                b.type == ContentBlockType.paragraph &&
+                b.marks.any(
+                  (m) =>
+                      m.type == InlineMarkType.emphasis &&
+                      m.style == 'italic',
+                ),
+          )
+          .toList();
+      expect(tables, hasLength(1));
+      expect(captions, hasLength(1));
+      // DOM order: table block first (rows came first in source), caption second.
+      expect(tables.single.end, lessThanOrEqualTo(captions.single.start));
+    });
+
+    test('caption BETWEEN thead and tbody: table block range spans entire '
+        'body; caption is swallowed (no duplicated render)', () {
+      // Codex round-final v1.2 HIGH: with first-slice-only table.range,
+      // the body BELOW caption was uncovered and rendered as duplicated
+      // gap text. The fix is to UNION table slices across the caption
+      // shadow so the table block's range covers HEAD..BODY end-to-end.
+      // Caption falls inside that range and is skipped (overlap guard).
+      // Acceptable v1.2 trade-off: malformed (caption-mid-table) input
+      // loses caption styling but rows render once, in the correct table
+      // widget.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<table><thead><tr><th>HEAD</th></tr></thead>'
+          '<caption>CAP</caption>'
+          '<tbody><tr><td>BODY</td></tr></tbody></table>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final tables =
+          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      final captions = blocks
+          .where(
+            (b) =>
+                b.type == ContentBlockType.paragraph &&
+                b.marks.any(
+                  (m) =>
+                      m.type == InlineMarkType.emphasis &&
+                      m.style == 'italic',
+                ),
+          )
+          .toList();
+      expect(tables, hasLength(1));
+      expect(captions, isEmpty);
+      // Rows include BOTH HEAD and BODY.
+      expect(tables.single.tableRows, [
+        ['HEAD'],
+        ['BODY'],
+      ]);
+
+      // Tighter regression: table block range covers the BODY text,
+      // not just HEAD — confirms the union fix.
+      final raw = extractStructured(html);
+      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
+      final extraction = SectionExtraction(
+        extracted: cleaned,
+        sectionStartElement: null,
+        sectionEndElement: null,
+      );
+      final json = EpubStructuredContentBuilder.build(extraction);
+      final parsed = StructuredContent.tryParse(json);
+      final tableBlock = parsed!.annotations.firstWhere(
+        (b) => b.type == ContentBlockType.table,
+      );
+      final tableSubstring = cleaned.text.substring(
+        tableBlock.start,
+        tableBlock.end,
+      );
+      expect(tableSubstring, contains('HEAD'));
+      expect(tableSubstring, contains('BODY'));
+    });
+
+    test('caption with block content (e.g. <p> inside): caption block '
+        'skipped, table still emits (documented v1.2 limit)', () {
+      // Senior round-final LOW-4: pin the documented limit so a future
+      // refactor that lifts the block-shadow rule in findCaptionAncestor
+      // breaks loudly here instead of silently.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<table><caption><p>cap</p></caption>'
+          '<tbody><tr><td>cell</td></tr></tbody></table>'
+          '</body></html>';
+      final raw = extractStructured(html);
+      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
+      final extraction = SectionExtraction(
+        extracted: cleaned,
+        sectionStartElement: null,
+        sectionEndElement: null,
+      );
+      final json = EpubStructuredContentBuilder.build(extraction);
+      final parsed = StructuredContent.tryParse(json);
+      expect(parsed, isNotNull);
+      // "cap" remains in plain text (emitter writes it).
+      expect(cleaned.text, contains('cap'));
+      // No italic-marked caption block (findCaptionAncestor block-shadow
+      // means caption never recorded a range).
+      final captions = parsed!.annotations
+          .where(
+            (b) =>
+                b.type == ContentBlockType.paragraph &&
+                b.marks.any(
+                  (m) =>
+                      m.type == InlineMarkType.emphasis &&
+                      m.style == 'italic',
+                ),
+          )
+          .toList();
+      expect(captions, isEmpty);
+      // Table still emits.
+      final tables = parsed.annotations
+          .where((b) => b.type == ContentBlockType.table)
+          .toList();
+      expect(tables, hasLength(1));
+      // Hash still validates.
+      expect(parsed.isValidFor(cleaned.text), isTrue);
+    });
+
+    test('table cell containing <pre> with surrounding text: ExtractedText '
+        'invariant preserved (no preserved-boundary straddle)', () {
+      // Codex round-final v1.2 HIGH defensive: when a <pre> sits inside
+      // a cell with text on either side, the table's union range would
+      // straddle the pre's preserved range. Defensive code drops the
+      // table's range entirely so ExtractedText doesn't throw. Both the
+      // table block AND the inner code block are suppressed for this
+      // shape (the table dispatch claims and the pre inside <td> isn't
+      // separately walked since <td> isn't a block container). All cell
+      // text and pre text remain in plainText as orphan plain content;
+      // hash still validates. Acknowledged v1.2 limit.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<table><tr><td>before<pre>code body</pre>after</td></tr></table>'
+          '</body></html>';
+      // Should not throw. Hash should validate.
+      final raw = extractStructured(html);
+      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
+      final extraction = SectionExtraction(
+        extracted: cleaned,
+        sectionStartElement: null,
+        sectionEndElement: null,
+      );
+      // build() catches errors and returns null; for this input we expect
+      // it to succeed (ExtractedText constructor must not throw).
+      final json = EpubStructuredContentBuilder.build(extraction);
+      expect(json, isNotNull);
+      final parsed = StructuredContent.tryParse(json);
+      expect(parsed, isNotNull);
+      expect(parsed!.isValidFor(cleaned.text), isTrue);
+    });
+
+    test('emitted blocks are non-overlapping and sorted by start', () {
+      // Senior round-final LOW-6: structural invariant covering all
+      // block types. Catches accidental overlap regressions (e.g. the
+      // round-final LOW-1 caption-after-rows case before its fix).
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<h2>Heading</h2>'
+          '<p>Some prose with <code>inline</code> code.</p>'
+          '<pre>void foo();</pre>'
+          '<ul><li>item one</li><li>item two</li></ul>'
+          '<dl><dt>term</dt><dd>def</dd></dl>'
+          '<table><caption>cap</caption>'
+          '<tbody><tr><td>x</td></tr></tbody></table>'
+          '<figure class="code"><figcaption>L1</figcaption>'
+          '<pre>code</pre></figure>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      // Sorted by start.
+      for (var i = 1; i < blocks.length; i++) {
+        expect(
+          blocks[i].start,
+          greaterThanOrEqualTo(blocks[i - 1].start),
+          reason: 'block at index $i (start=${blocks[i].start}) is '
+              'before previous block (start=${blocks[i - 1].start})',
+        );
+      }
+      // Non-overlapping: each block's start >= previous block's end.
+      for (var i = 1; i < blocks.length; i++) {
+        expect(
+          blocks[i].start,
+          greaterThanOrEqualTo(blocks[i - 1].end),
+          reason: 'block at index $i [${blocks[i].start}, ${blocks[i].end}) '
+              'overlaps previous [${blocks[i - 1].start}, ${blocks[i - 1].end})',
+        );
+      }
+    });
+
+    test('hash validates over plain text for table fixture', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<table><caption>caption text</caption>'
+          '<thead><tr><th>H</th></tr></thead>'
+          '<tbody><tr><td>D</td></tr></tbody></table>'
+          '</body></html>';
+      final raw = extractStructured(html);
+      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
+      final extraction = SectionExtraction(
+        extracted: cleaned,
+        sectionStartElement: null,
+        sectionEndElement: null,
+      );
+      final json = EpubStructuredContentBuilder.build(extraction);
+      final parsed = StructuredContent.tryParse(json);
+      expect(parsed, isNotNull);
+      expect(parsed!.isValidFor(cleaned.text), isTrue);
+    });
+
     test('lists emit in beginning-only section (no fragmentId, with '
         'nextFragmentId)', () {
       // Codex round-1 MEDIUM: _extractUntilElement previously skipped

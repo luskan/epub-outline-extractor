@@ -228,6 +228,7 @@ class EpubStructuredContentBuilder {
     if (_recurseIntoCodeFigureWrapperIfApplicable(node, ctx)) return;
     if (_emitListContainerIfApplicable(node, ctx)) return;
     if (_emitDefinitionListIfApplicable(node, ctx)) return;
+    if (_emitTableBlockIfApplicable(node, ctx)) return;
 
     // Fuzzy-match dispatches (heading, paragraph) DO need the section
     // gate — they search plainText for a content match, and out-of-section
@@ -479,6 +480,186 @@ class EpubStructuredContentBuilder {
         state.inDirectTextRun = true;
       }
     }
+  }
+
+  /// v1.2: claim a `<table>` container. Emits an italic-marked caption
+  /// paragraph block AND a table block (with `tableRows` from `<tr>`/
+  /// `<th>`/`<td>` descendants). Both blocks are emitted in **plain-text
+  /// DOM order**: whichever range starts earlier emits first, so
+  /// out-of-spec source like `<table><tbody>...</tbody><caption>...
+  /// </caption></table>` (caption AFTER body, which package:html does
+  /// NOT normalise) still produces both blocks without one stealing the
+  /// other's offset via the searchFrom cursor.
+  ///
+  /// The emitter records `<table>`'s range over BODY content (excluding
+  /// outermost-own-direct-child `<caption>`). When caption sits between
+  /// row groups, the union of body slices may swallow the caption's
+  /// offset; in that case the caption block is suppressed (overlap
+  /// guard) — acceptable v1.2 trade-off for malformed input that
+  /// preserves all row data in the table widget.
+  ///
+  /// Acknowledged limits (plan §5.10):
+  /// - No rowspan/colspan handling. Cells taken as-is; renderer pads
+  ///   short rows.
+  /// - Inline `<code>` inside cells gets no monospace mark (the table
+  ///   handler doesn't recurse into cell children for inline-mark
+  ///   collection — would conflict with the row-level extraction).
+  /// - Nested `<table>`s flattened (inner table cells emit text, outer
+  ///   table block range covers them).
+  /// - `<caption>` containing block-level content (e.g. `<p>` inside)
+  ///   records no caption range (findCaptionAncestor shadows on blocks).
+  ///   The table still emits; caption text becomes orphan plain text.
+  /// - `<pre>` inside a table cell is **not separately dispatched** as a
+  ///   code block (the table claims dispatch and the walker doesn't
+  ///   recurse through `<td>` since `<td>` isn't a block container).
+  ///   Pre text appears flattened into the cell text. The table block's
+  ///   recorded range is whichever non-straddling body slice the emitter
+  ///   captured first; if no body slice is non-straddling (e.g. a single
+  ///   slice covers text-pre-text in one cell), no table block emits at
+  ///   all. Cell text remains in plainText regardless.
+  static bool _emitTableBlockIfApplicable(
+    dom.Element node,
+    _WalkContext ctx,
+  ) {
+    if (ctx.elementRanges == null) return false;
+    if (node.localName?.toLowerCase() != 'table') return false;
+
+    // Codex round-1 v1.2 MEDIUM: nested tables are flattened into the
+    // outer table's cell text. Skip dispatch for nested `<table>`s so
+    // they don't emit separate table blocks (which would visually
+    // duplicate the inner-cell content already shown inside the outer
+    // cell). Returning false here lets the walker fall through to
+    // _isBlockContainer recursion, which doesn't emit either since
+    // <td>/<th> aren't paragraph-like.
+    if (_hasTableAncestor(node)) return false;
+
+    // Find the first `<caption>` child (if any). HTML5 specifies caption
+    // must be the first child of table; we don't enforce position.
+    dom.Element? caption;
+    for (final c in node.children) {
+      if (c.localName?.toLowerCase() == 'caption') {
+        caption = c;
+        break;
+      }
+    }
+
+    // Resolve caption and table ranges up front, then emit in plain-text
+    // order (smaller start first). HTML5 says caption must be the first
+    // child of `<table>` so the natural order is caption-then-table — but
+    // package:html doesn't normalise position, so malformed input like
+    // `<table><tbody>...</tbody><caption>cap</caption></table>` parses
+    // with caption AFTER the body content. Without the order check, the
+    // searchFrom cursor would advance past the (later) caption and the
+    // (earlier) table block would be claim+skipped (senior round-final
+    // LOW-1).
+    TextRange? captionRange;
+    if (caption != null) {
+      final capRanges = ctx.elementRanges![caption];
+      if (capRanges != null && capRanges.isNotEmpty) {
+        final r = capRanges.first;
+        if (r.end > r.start) captionRange = r;
+      }
+    }
+
+    // Build tableRows by walking thead/tbody/tfoot containers and
+    // collecting <tr> children's <th>/<td> cells.
+    final rows = _collectTableRows(node);
+    final tableRanges = ctx.elementRanges![node];
+    final tableRange = (rows.isNotEmpty &&
+            tableRanges != null &&
+            tableRanges.isNotEmpty &&
+            tableRanges.first.end > tableRanges.first.start)
+        ? tableRanges.first
+        : null;
+
+    void emitCaption() {
+      final r = captionRange;
+      if (r == null) return;
+      if (r.start < ctx.searchFrom) return;
+      ctx.recordBlock(
+        ContentBlock(
+          type: ContentBlockType.paragraph,
+          start: r.start,
+          end: r.end,
+          marks: [
+            InlineMark(
+              type: InlineMarkType.emphasis,
+              start: r.start,
+              end: r.end,
+              style: 'italic',
+            ),
+          ],
+        ),
+      );
+    }
+
+    void emitTable() {
+      final r = tableRange;
+      if (r == null) return;
+      if (r.start < ctx.searchFrom) return;
+      ctx.recordBlock(
+        ContentBlock(
+          type: ContentBlockType.table,
+          start: r.start,
+          end: r.end,
+          tableRows: rows,
+        ),
+      );
+    }
+
+    // Emit in plain-text DOM order: whichever range starts first.
+    if (captionRange != null &&
+        tableRange != null &&
+        tableRange.start < captionRange.start) {
+      emitTable();
+      emitCaption();
+    } else {
+      emitCaption();
+      emitTable();
+    }
+    return true;
+  }
+
+  /// Walk a `<table>` subtree and collect its rows. Handles direct `<tr>`
+  /// children (HTML5 parser inserts implicit `<tbody>`, but be defensive)
+  /// as well as `<thead>`/`<tbody>`/`<tfoot>` row-group containers.
+  /// Cells are collected as plain text with whitespace collapsed.
+  static List<List<String>> _collectTableRows(dom.Element table) {
+    final rows = <List<String>>[];
+    void walkRowContainer(dom.Element node) {
+      for (final c in node.children) {
+        final tag = c.localName?.toLowerCase();
+        if (tag == 'tr') {
+          final cells = <String>[];
+          for (final cell in c.children) {
+            final ctag = cell.localName?.toLowerCase();
+            if (ctag == 'th' || ctag == 'td') {
+              cells.add(_collapseCellWhitespace(cell.text));
+            }
+          }
+          rows.add(cells);
+        } else if (tag == 'thead' || tag == 'tbody' || tag == 'tfoot') {
+          walkRowContainer(c);
+        }
+      }
+    }
+
+    walkRowContainer(table);
+    return rows;
+  }
+
+  static String _collapseCellWhitespace(String s) {
+    return s.trim().replaceAll(RegExp(r'\s+'), ' ');
+  }
+
+  /// True iff [node] has a `<table>` ancestor (i.e. it's a nested table).
+  static bool _hasTableAncestor(dom.Element node) {
+    var cur = node.parent;
+    while (cur is dom.Element) {
+      if (cur.localName?.toLowerCase() == 'table') return true;
+      cur = cur.parent;
+    }
+    return false;
   }
 
   /// Walk a `<dt>`'s subtree in DOM order, dispatching block descendants
