@@ -109,6 +109,135 @@ void main() {
         }
       });
 
+      test('Table of Contents emits ≥100 listItem blocks with inline marks',
+          () {
+        // Plan v5 Fix 6 cpp20 integration assertions.
+        final sections = _flatSections(extraction!.root.subsections);
+        final toc = sections.firstWhere(
+          (s) => s.title == 'Table of Contents',
+          orElse: () => throw StateError(
+              'Table of Contents section not found in cpp20.epub'),
+        );
+        expect(toc.structuredContentJson, isNotNull,
+            reason: 'TOC must have structuredContentJson after Fix 1');
+        final parsed =
+            StructuredContent.tryParse(toc.structuredContentJson!);
+        expect(parsed, isNotNull);
+        final blocks = parsed!.annotations;
+
+        // (a) ≥ 100 listItem blocks (TOC has ~24 chapters × ~10 sub-entries).
+        final listItems = blocks
+            .where((b) => b.type == ContentBlockType.listItem)
+            .toList(growable: false);
+        expect(listItems.length, greaterThanOrEqualTo(100),
+            reason: 'expected ≥100 listItem blocks; got '
+                '${listItems.length}. Total blocks: ${blocks.length}.');
+
+        // (b) Strong-coverage property: every non-ws char in plainText is
+        // covered by at least one block range. cpp20 TOC is well-formed
+        // <nav><ol><li> so this holds.
+        final plainText = toc.content.join('\n');
+        final covered = List<bool>.filled(plainText.length, false);
+        for (final b in blocks) {
+          for (var i = b.start; i < b.end && i < plainText.length; i++) {
+            covered[i] = true;
+          }
+        }
+        var firstUncoveredIdx = -1;
+        for (var i = 0; i < plainText.length; i++) {
+          final c = plainText.codeUnitAt(i);
+          final isWs = c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D;
+          if (!isWs && !covered[i]) {
+            firstUncoveredIdx = i;
+            break;
+          }
+        }
+        expect(firstUncoveredIdx, -1,
+            reason: 'cpp20 TOC strong-coverage gap at offset '
+                '$firstUncoveredIdx; '
+                'context: "${plainText.substring(
+                    (firstUncoveredIdx - 20).clamp(0, plainText.length),
+                    (firstUncoveredIdx + 40).clamp(0, plainText.length),
+                  )}"');
+
+        // (c) At least one listItem has ≥ 1 monospace mark.
+        final listItemsWithMono = listItems
+            .where(
+              (li) => li.marks.any((m) => m.type == InlineMarkType.monospace),
+            )
+            .toList(growable: false);
+        expect(listItemsWithMono, isNotEmpty,
+            reason: 'no listItem in cpp20 TOC carries a monospace mark — '
+                'Fix 3 not wired through');
+
+        // (d) Positive presence: at least one listItem has 2 monospace
+        // marks at distinct offsets with distinct lengths (proves Fix 2's
+        // cursor advance for sibling <code>s with different text).
+        final liWithTwoDistinctLengths = listItemsWithMono.where((li) {
+          final monos = li.marks
+              .where((m) => m.type == InlineMarkType.monospace)
+              .toList();
+          if (monos.length < 2) return false;
+          final lengths = monos.map((m) => m.end - m.start).toSet();
+          if (lengths.length < 2) return false;
+          final starts = monos.map((m) => m.start).toSet();
+          return starts.length == monos.length;
+        }).toList(growable: false);
+        expect(liWithTwoDistinctLengths, isNotEmpty,
+            reason: 'no listItem with 2 distinct-length monospace marks at '
+                'distinct offsets — sibling cursor advance regression');
+
+        // (e) "1.3 Defining operator<=> and operator==" entry — exactly 2
+        // monospace marks: one of length 11 (operator<=>), one of 10
+        // (operator==). cpp20.epub is a pinned local fixture, so the entry
+        // MUST exist; no silent skip via if-isNotEmpty (codex round-5 LOW).
+        final cpp20Entry = listItems.where((li) {
+          final txt = plainText.substring(li.start, li.end);
+          return txt.contains('Defining') &&
+              txt.contains('operator<=>') &&
+              txt.contains('operator==');
+        }).toList(growable: false);
+        expect(cpp20Entry, isNotEmpty,
+            reason: 'cpp20 TOC must contain the "1.3 Defining operator<=> '
+                'and operator==" listItem block');
+        final entry = cpp20Entry.first;
+        final monos = entry.marks
+            .where((m) => m.type == InlineMarkType.monospace)
+            .toList();
+        // Plan v5 §6: EXACTLY 2 monospace marks (one per <code>) of
+        // lengths 11 (operator<=>) and 10 (operator==).
+        expect(monos, hasLength(2),
+            reason: 'cpp20 "1.3 Defining operator<=>" entry must carry '
+                'exactly 2 monospace marks');
+        final lengths = monos.map((m) => m.end - m.start).toList()..sort();
+        expect(lengths, equals(<int>[10, 11]),
+            reason: 'lengths must be exactly [10, 11]; got $lengths');
+
+        // (f) Every mark satisfies block.start <= mark.start < mark.end <= block.end.
+        for (final b in blocks) {
+          for (final m in b.marks) {
+            expect(m.start, greaterThanOrEqualTo(b.start),
+                reason: 'mark.start ${m.start} < block.start ${b.start}');
+            expect(m.end, lessThanOrEqualTo(b.end),
+                reason: 'mark.end ${m.end} > block.end ${b.end}');
+            expect(m.start, lessThan(m.end),
+                reason: 'mark has zero/negative length');
+          }
+        }
+
+        // (g) No two marks within a single block share both start AND end.
+        for (final b in blocks) {
+          final seen = <String>{};
+          for (final m in b.marks) {
+            final key = '${m.start}-${m.end}-${m.type.name}-${m.style ?? ''}';
+            expect(seen.contains(key), isFalse,
+                reason: 'duplicate mark at $key in block at '
+                    '[${b.start}, ${b.end})');
+            seen.add(key);
+          }
+        }
+      });
+
       test('block multiset summary (structural snapshot)', () {
         // Plan §7.5: capture a stable multi-set of (blockType,
         // preserveLineBreaks, hasMonospaceMark) triples across all

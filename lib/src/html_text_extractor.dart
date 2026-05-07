@@ -126,6 +126,11 @@ String extractSectionText(
 /// **raw, pre-cleaning** [ExtractedText]. Pipe through
 /// [TextCleaner.cleanExtractedTextRespectingRanges] to get the cleaned form
 /// with ranges remapped.
+///
+/// Calling with `(_, null, null)` walks `document.body` only (matches
+/// [extractStructured]); use [extractStructured] directly for clarity at
+/// call sites that don't need [SectionExtraction]'s start/end-element
+/// fields.
 SectionExtraction extractSectionStructured(
   String htmlContent,
   String? fragmentId,
@@ -145,7 +150,20 @@ SectionExtraction extractSectionStructured(
           document.querySelector('[name="$nextFragmentId"]');
       _extractUntilElement(document, nextFragmentId, emitter, logger);
     } else {
-      _walkAll(document, emitter);
+      // Walk body only — matches [extractStructured]. Walking the whole
+      // document would leak `<head><title>` text into plainText.
+      final body = document.body;
+      if (body != null) {
+        _walkAll(body, emitter);
+      }
+      // Symmetry with [extractStructured]: explicitly close any open
+      // li/dt/dd/table/caption state. toExtractedText also defensively
+      // cleans up, but doing it here keeps the emitter's lifecycle
+      // consistent across all extraction paths.
+      emitter.syncDirectLi(null);
+      emitter.syncDtDd(null);
+      emitter.syncTable(null);
+      emitter.syncCaption(null);
     }
   } else {
     startElement = document.querySelector('#$fragmentId') ??

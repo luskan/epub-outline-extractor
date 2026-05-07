@@ -380,35 +380,39 @@ class EpubExtractor {
         }
       }
 
-      // Extract section text. v1.0: for fragment-based sections, use the
-      // structured pipeline (extractSectionStructured → range-aware
-      // cleaner) so <pre> code blocks survive whitespace collapse and
-      // power preserveLineBreaks + monospace marks downstream. The
-      // legacy `extractSectionText` path is kept for safety on sections
-      // that fall through (no html content, etc.).
+      // Extract section text. v1.0: route every chapter with HTML content
+      // through the structured pipeline so <pre> code blocks survive
+      // whitespace collapse and power preserveLineBreaks + monospace marks
+      // downstream — including spine-only chapters (no fragment, no
+      // following same-file fragment) which previously fell into the
+      // legacy `chapters[i].text` branch with structuredExtraction = null.
+      //
+      // For both-null fragments we use [extractStructured] (body-only
+      // walker) as the explicit production call form; Fix 5 also makes
+      // `extractSectionStructured(_, null, null)` body-only, but using
+      // [extractStructured] here makes intent obvious at the call site.
+      // The legacy `extractSectionText` / `chapters[i].text` paths are
+      // kept only as catch-handler fallbacks.
       String sectionText;
       SectionExtraction? structuredExtraction;
-      if (fragment != null || nextFragment != null) {
-        final htmlContent = htmlContentMap[file];
-        if (htmlContent == null) {
-          _logger.fine(
-            'SKIPPED: "${tocItem.title}" - HTML content not found for $file',
-          );
-          flatBookSections.add(null);
-          continue;
-        }
-
-        // Defensive: any unexpected throw in the v1.0 pipeline (validator
-        // ArgumentError, EditScript RangeError, etc.) MUST NOT abort the
-        // whole EPUB import. Fall back to the legacy String-returning
-        // `extractSectionText` for this single section.
+      final htmlContent = htmlContentMap[file];
+      if (htmlContent != null) {
         try {
-          final raw = extractSectionStructured(
-            htmlContent,
-            fragment,
-            nextFragment,
-            logger: _logger.fine,
-          );
+          final SectionExtraction raw;
+          if (fragment == null && nextFragment == null) {
+            raw = SectionExtraction(
+              extracted: extractStructured(htmlContent),
+              sectionStartElement: null,
+              sectionEndElement: null,
+            );
+          } else {
+            raw = extractSectionStructured(
+              htmlContent,
+              fragment,
+              nextFragment,
+              logger: _logger.fine,
+            );
+          }
           final cleaned =
               TextCleaner.cleanExtractedTextRespectingRanges(raw.extracted);
           sectionText = cleaned.text;
@@ -420,16 +424,19 @@ class EpubExtractor {
         } catch (e, st) {
           _logger.warning(
             'v1.0 structured pipeline failed for "${tocItem.title}", '
-            'falling back to legacy extraction: $e',
+            'falling back to legacy extraction (expect coverage gaps and '
+            'limited inline marks): $e',
             e,
             st,
           );
-          sectionText = extractSectionText(
-            htmlContent,
-            fragment,
-            nextFragment,
-            logger: _logger.fine,
-          );
+          sectionText = (fragment != null || nextFragment != null)
+              ? extractSectionText(
+                  htmlContent,
+                  fragment,
+                  nextFragment,
+                  logger: _logger.fine,
+                )
+              : chapters[chapterIndex].text;
           structuredExtraction = null;
         }
 

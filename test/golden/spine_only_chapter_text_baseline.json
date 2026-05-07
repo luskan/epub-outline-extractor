@@ -1,0 +1,107 @@
+[
+  {
+    "epub": "cpp20",
+    "title": "title_page",
+    "hasAnchor": false,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "len": 0
+  },
+  {
+    "epub": "cpp20",
+    "title": "C++20 - The Complete Guide",
+    "hasAnchor": false,
+    "sha256": "10356711abb0d4bd682d93bc2771e12f14944abe959dfc3202e6a7731e0a4d1e",
+    "len": 511
+  },
+  {
+    "epub": "cpp20",
+    "title": "Black Lives Matter",
+    "hasAnchor": false,
+    "sha256": "bb11f8b8e9a85e64109b116ca99223bd682dd3e066c8ed1e0069da6f6233e485",
+    "len": 18
+  },
+  {
+    "epub": "cpp20",
+    "title": "Table of Contents",
+    "hasAnchor": false,
+    "sha256": "f4ad2cae4ab34f9a65cd88f676ba4ae239e194ab3bc0b402dcb8b620916d4ff4",
+    "len": 17746
+  },
+  {
+    "epub": "cpp20",
+    "title": "Preface",
+    "hasAnchor": true,
+    "sha256": "9b9c90fb3449b0839f0c92515c895f160a412527115e922b84d19bcae4cf9c50",
+    "len": 442
+  },
+  {
+    "epub": "alicesAdventures",
+    "title": "wrap0000",
+    "hasAnchor": false,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "len": 0
+  },
+  {
+    "epub": "alicesAdventures",
+    "title": "Chapter I",
+    "hasAnchor": true,
+    "sha256": "a91e3cdcce514884cf632623b153f5c38bde3626d42bcfb73f4cc48974bd8b1d",
+    "len": 20477
+  },
+  {
+    "epub": "alicesAdventures",
+    "title": "Chapter II",
+    "hasAnchor": true,
+    "sha256": "14d2f94aef4fbbf4f9fb9261ecf84ebfda2b6d63b0dde247e2d869c98bf3870e",
+    "len": 12796
+  },
+  {
+    "epub": "alicesAdventures",
+    "title": "Chapter III",
+    "hasAnchor": true,
+    "sha256": "490ff7441e95c67a29d09488b9585655b4dba8b7a278817ca07698a583becb2c",
+    "len": 13551
+  },
+  {
+    "epub": "alicesAdventures",
+    "title": "Chapter IV",
+    "hasAnchor": true,
+    "sha256": "93f0dc40607b0f7fd8df3189aa2b9186dbdfe35b4fa5b05f47e25e98df4c4ed1",
+    "len": 14214
+  },
+  {
+    "epub": "frankenstein",
+    "title": "wrap0000",
+    "hasAnchor": false,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "len": 0
+  },
+  {
+    "epub": "frankenstein",
+    "title": "or, the Modern Prometheus",
+    "hasAnchor": true,
+    "sha256": "93a8d89b44d9ec95dd67e2903749f6bb08e2f7ea55808a38575499df5c97c623",
+    "len": 25
+  },
+  {
+    "epub": "frankenstein",
+    "title": "CONTENTS",
+    "hasAnchor": true,
+    "sha256": "2a08bd4b24ab7ea7c059387e0f6764013da8d5fd16b277f1267ef3f263b5bdf6",
+    "len": 327
+  },
+  {
+    "epub": "frankenstein",
+    "title": "Letter 1",
+    "hasAnchor": true,
+    "sha256": "577de2fd53d67e754fa97aef89dba5039e75ed466a9b19e84fbdfa04bbd477a5",
+    "len": 6840
+  },
+  {
+    "epub": "frankenstein",
+    "title": "Letter 2",
+    "hasAnchor": true,
+    "sha256": "7fc7a8e0e57e12735af948e1f8839181652d1f494a9e9df5b5581e31bd459e3d",
+    "len": 7346
+  }
+]

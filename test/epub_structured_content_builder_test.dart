@@ -1264,4 +1264,597 @@ void main() {
       expect(items, hasLength(2));
     });
   });
+
+  // ---------------------------------------------------------------------
+  // listItem inline marks (Fix 3) + inline-mark cursor (Fix 2) + flow (Fix 1)
+  // ---------------------------------------------------------------------
+  group('EpubStructuredContentBuilder.build (v1.0) — listItem inline marks',
+      () {
+    List<ContentBlock> buildFromFullPipeline(String html) {
+      final raw = extractStructured(html);
+      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
+      final extraction = SectionExtraction(
+        extracted: cleaned,
+        sectionStartElement: null,
+        sectionEndElement: null,
+      );
+      final json = EpubStructuredContentBuilder.build(extraction);
+      expect(json, isNotNull, reason: 'build returned null');
+      final parsed = StructuredContent.tryParse(json);
+      expect(parsed, isNotNull);
+      return parsed!.annotations;
+    }
+
+    test('Fix 3 — sibling same-text <code>X</code> siblings emit at distinct '
+        'offsets', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ol><li>foo <code>X</code> middle <code>X</code> end</li></ol>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final listItems = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList(growable: false);
+      expect(listItems, hasLength(1));
+      final monos = listItems.single.marks
+          .where((m) => m.type == InlineMarkType.monospace)
+          .toList();
+      expect(monos, hasLength(2));
+      expect(monos[0].start, isNot(monos[1].start));
+      // Both within the listItem range.
+      for (final m in monos) {
+        expect(m.start, greaterThanOrEqualTo(listItems.single.start));
+        expect(m.end, lessThanOrEqualTo(listItems.single.end));
+      }
+    });
+
+    test('Fix 3 — different-text <code> siblings have distinct lengths', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ol><li><code>foo</code> and <code>longer_bar</code></li></ol>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final listItems = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList(growable: false);
+      expect(listItems, hasLength(1));
+      final monos = listItems.single.marks
+          .where((m) => m.type == InlineMarkType.monospace)
+          .toList();
+      expect(monos, hasLength(2));
+      final lengths = monos.map((m) => m.end - m.start).toList();
+      // foo = 3 chars; longer_bar = 10 chars.
+      expect(lengths, containsAll(<int>[3, 10]));
+    });
+
+    test('Fix 3 — cpp20-shaped TOC entry emits two distinct monospace marks',
+        () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters total here.</p>'
+          '<nav><ol>'
+          '<li><a href="chap02.xhtml#x">'
+          '<span class="section-number">1.3 </span>'
+          'Defining <code>operator&lt;=&gt;</code> and <code>operator==</code>'
+          '</a></li>'
+          '</ol></nav>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final listItems = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList(growable: false);
+      expect(listItems, hasLength(1));
+      final li = listItems.single;
+      final monos = li.marks
+          .where((m) => m.type == InlineMarkType.monospace)
+          .toList();
+      expect(monos, hasLength(2));
+      // operator<=> = 11 chars; operator== = 10 chars.
+      final lengths = monos.map((m) => m.end - m.start).toList();
+      expect(lengths, containsAll(<int>[11, 10]));
+      // Distinct offsets, both within the listItem range.
+      expect(monos[0].start, isNot(monos[1].start));
+      for (final m in monos) {
+        expect(m.start, greaterThanOrEqualTo(li.start));
+        expect(m.end, lessThanOrEqualTo(li.end));
+      }
+    });
+
+    test('Fix 3 — slice 2-only <code> emits on slice 2, not slice 1',
+        () {
+      // <p>BLOCK</p> splits the <li> into two slices. The <code> tag
+      // sits wholly in slice 2. The slice-membership counter filters
+      // the <code> out of slice 1's mark walk before _matchInlineMark
+      // is invoked. (The defense-in-depth `idx >= searchEnd` branch
+      // inside _matchInlineMark is no longer driven by this fixture
+      // since the slice counter rejects earlier — kept anyway as a
+      // safety net for non-trivial cleaner remappings.)
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters total here.</p>'
+          '<ol>'
+          '<li>prefix text run <p>BLOCK</p> '
+          '<code>uniquemarkertext</code></li>'
+          '</ol>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final listItems = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList(growable: false);
+      // Two slices for the <li> (split by <p>BLOCK</p>).
+      expect(listItems, hasLength(2));
+      // Slice 1 has zero monospace marks (the <code> is in slice 2;
+      // slice-membership counter filters it out).
+      final slice1Monos = listItems[0].marks
+          .where((m) => m.type == InlineMarkType.monospace)
+          .toList();
+      expect(slice1Monos, isEmpty,
+          reason: 'slice-membership counter must filter slice-2 <code> '
+              'out of slice 1\'s mark walk');
+      // Slice 2 has exactly one monospace mark for the <code>.
+      final slice2Monos = listItems[1].marks
+          .where((m) => m.type == InlineMarkType.monospace)
+          .toList();
+      expect(slice2Monos, hasLength(1));
+    });
+
+    test('Fix 3 — slice-membership filter prevents cross-slice attribution '
+        '(no false-positive marks on plain text)', () {
+      // Slice 1 of the <li> contains "aaa <code>bbb</code> filler text
+      // bbbcccddd"; slice 2 contains " <code>bbbcccddd</code> tail".
+      //
+      // The slice-membership counter (codex rounds 5+6+7) ensures that
+      // the second <code>bbbcccddd</code> element — which sits AFTER
+      // the <p>BLOCK</p> in DOM order — is NOT considered when
+      // collecting marks for slice 1. Without the counter,
+      // _walkSliceForMarks would walk the whole <li> and the second
+      // <code>'s text "bbbcccddd" would match the plain-text
+      // "bbbcccddd" in slice 1 (false-positive monospace mark on plain
+      // prose).
+      //
+      // Asserts slice 1 emits EXACTLY 1 monospace mark (the first
+      // <code>bbb</code>, 3 chars). Slice 2 emits EXACTLY 1 monospace
+      // mark for the second <code>bbbcccddd</code> (9 chars).
+      //
+      // Note: the original test name claimed this drove the
+      // `endIdx > searchEnd` overflow branch, but after the
+      // slice-membership filter the second <code> is rejected at the
+      // counter-membership check before _matchInlineMark is invoked,
+      // so the overflow branch is no longer driven here. The overflow
+      // guard remains as defense-in-depth — see _matchInlineMark in
+      // epub_structured_content_builder.dart for its semantic.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters total here.</p>'
+          '<ol>'
+          '<li>aaa <code>bbb</code> filler text bbbcccddd '
+          '<p>BLOCK</p>'
+          ' <code>bbbcccddd</code> tail</li>'
+          '</ol>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final listItems = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList(growable: false);
+      expect(listItems, hasLength(2));
+      final slice1Monos = listItems[0].marks
+          .where((m) => m.type == InlineMarkType.monospace)
+          .toList();
+      // EXACTLY one mark — the first <code>bbb</code> (3 chars). The
+      // slice-membership filter prevents the slice-2 <code>bbbcccddd</code>
+      // from matching the plain text "bbbcccddd" inside slice 1.
+      expect(slice1Monos, hasLength(1),
+          reason: 'slice 1 must emit exactly 1 monospace mark; got '
+              '${slice1Monos.length}: ${slice1Monos.map((m) => "[${m.start},${m.end})").toList()}');
+      expect(slice1Monos.single.end - slice1Monos.single.start, 3);
+
+      // Slice 2 emits exactly 1 monospace mark for <code>bbbcccddd</code> (9 chars).
+      final slice2Monos = listItems[1].marks
+          .where((m) => m.type == InlineMarkType.monospace)
+          .toList();
+      expect(slice2Monos, hasLength(1));
+      expect(slice2Monos.single.end - slice2Monos.single.start, 9);
+    });
+
+    test('Fix 2 — sibling overflow positive control: 2 marks fit cleanly',
+        () {
+      // Positive control matched to test 4b: same shape but the second
+      // <code> is shorter and fits cleanly within slice 1's bound.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters total here.</p>'
+          '<ol>'
+          '<li>aaa <code>bbb</code> mid <code>ccc</code> tail '
+          '<p>BLOCK</p>'
+          ' final</li>'
+          '</ol>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final listItems = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList(growable: false);
+      expect(listItems, hasLength(2));
+      // Slice 1: both <code>bbb</code> and <code>ccc</code> fit — emit 2
+      // marks at distinct offsets.
+      final slice1 = listItems[0];
+      final slice1Monos = slice1.marks
+          .where((m) => m.type == InlineMarkType.monospace)
+          .toList();
+      expect(slice1Monos, hasLength(2));
+      expect(slice1Monos[0].start, isNot(slice1Monos[1].start));
+      // Both within slice 1's range.
+      for (final m in slice1Monos) {
+        expect(m.start, greaterThanOrEqualTo(slice1.start));
+        expect(m.end, lessThanOrEqualTo(slice1.end));
+      }
+    });
+
+    test('Fix 2 — heading inline marks: <h2>foo <code>X</code> and <code>X</code></h2>',
+        () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters total here.</p>'
+          '<h2>foo <code>X</code> and <code>X</code></h2>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final headings = blocks
+          .where((b) => b.type == ContentBlockType.heading)
+          .toList(growable: false);
+      expect(headings, hasLength(1));
+      final h = headings.single;
+      final monos = h.marks
+          .where((m) => m.type == InlineMarkType.monospace)
+          .toList();
+      expect(monos, hasLength(2));
+      expect(monos[0].start, isNot(monos[1].start));
+    });
+
+    test('Fix 1 — spine-only synthetic chapter emits listItems and marks; no '
+        '<head><title> leak', () {
+      // Synthetic well-formed <nav><h2><ol><li> document. Pass through
+      // extractStructured + EpubStructuredContentBuilder.build (mirrors
+      // the v1.0 spine-only flow after Fix 1).
+      const html = '<html><head><title>Ignore Me</title></head><body><nav>'
+          '<h2>TOC</h2>'
+          '<ol>'
+          '<li><a href="ch01.xhtml">Chapter 1: <code>vector</code></a></li>'
+          '<li><a href="ch02.xhtml">Chapter 2: <code>operator==</code></a>'
+          '<ol>'
+          '<li><a href="ch02.xhtml#x">2.1 nested item</a></li>'
+          '</ol>'
+          '</li>'
+          '</ol>'
+          '</nav>'
+          '<p>Padding so the chapter exceeds fifty characters total here.</p>'
+          '</body></html>';
+      final raw = extractStructured(html);
+      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
+      final plainText = cleaned.text;
+      // No <head><title> leak.
+      expect(plainText.contains('Ignore Me'), isFalse);
+      // Strong-coverage gate over body — plainText must START with the
+      // <h2>TOC</h2> heading text, not "Ignore Me".
+      expect(plainText.trimLeft().startsWith('TOC'), isTrue);
+
+      final extraction = SectionExtraction(
+        extracted: cleaned,
+        sectionStartElement: null,
+        sectionEndElement: null,
+      );
+      final json = EpubStructuredContentBuilder.build(extraction);
+      expect(json, isNotNull);
+      final parsed = StructuredContent.tryParse(json);
+      expect(parsed, isNotNull);
+      final blocks = parsed!.annotations;
+
+      // At least 3 listItem blocks: Chapter 1, Chapter 2, 2.1 nested.
+      final listItems = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList(growable: false);
+      expect(listItems.length, greaterThanOrEqualTo(3));
+
+      // At least 2 monospace marks across all listItems with distinct
+      // lengths: vector (6), operator== (10).
+      final allMonos = <InlineMark>[];
+      for (final li in listItems) {
+        allMonos.addAll(
+          li.marks.where((m) => m.type == InlineMarkType.monospace),
+        );
+      }
+      expect(allMonos.length, greaterThanOrEqualTo(2));
+      final lengths = allMonos.map((m) => m.end - m.start).toSet();
+      expect(lengths, containsAll(<int>[6, 10]));
+
+      // Strong-coverage property: every non-whitespace char in plainText
+      // covered by at least one block range.
+      final covered = List<bool>.filled(plainText.length, false);
+      for (final b in blocks) {
+        for (var i = b.start; i < b.end && i < plainText.length; i++) {
+          covered[i] = true;
+        }
+      }
+      for (var i = 0; i < plainText.length; i++) {
+        final c = plainText.codeUnitAt(i);
+        final isWs = c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D;
+        if (!isWs) {
+          expect(covered[i], isTrue,
+              reason: 'char at offset $i ("${plainText[i]}") not covered '
+                  'by any block in spine-only synthetic fixture');
+        }
+      }
+
+      // Every mark fits within its enclosing block; no two marks within a
+      // block share both start AND end.
+      for (final b in blocks) {
+        for (final m in b.marks) {
+          expect(m.start, greaterThanOrEqualTo(b.start));
+          expect(m.end, lessThanOrEqualTo(b.end));
+        }
+        final seen = <String>{};
+        for (final m in b.marks) {
+          final key = '${m.start}-${m.end}';
+          expect(seen.contains(key), isFalse,
+              reason: 'duplicate mark offsets in single block at '
+                  '[${b.start}, ${b.end})');
+          seen.add(key);
+        }
+      }
+    });
+
+    test('Fix 5 — extractStructured does not leak <head><title> text', () {
+      const html = '<html><head><title>HEADTEXT</title></head>'
+          '<body><h2>BODYTEXT</h2>'
+          '<p>Padding so the chapter exceeds fifty characters total here.</p>'
+          '</body></html>';
+      final raw = extractStructured(html);
+      expect(raw.text.contains('HEADTEXT'), isFalse);
+      expect(raw.text.trimLeft().startsWith('BODYTEXT'), isTrue);
+    });
+
+    test('Fix 5 — extractSectionStructured(_, null, null) does not leak '
+        '<head><title> text', () {
+      const html = '<html><head><title>HEADTEXT</title></head>'
+          '<body><h2>BODYTEXT</h2>'
+          '<p>Padding so the chapter exceeds fifty characters total here.</p>'
+          '</body></html>';
+      final raw = extractSectionStructured(html, null, null);
+      expect(raw.extracted.text.contains('HEADTEXT'), isFalse);
+      expect(raw.extracted.text.trimLeft().startsWith('BODYTEXT'), isTrue);
+    });
+
+    test('Fix 3 — nested <ol> with formatted whitespace: clamp overlapping '
+        'slices (boundary-whitespace overlap)', () {
+      // EPUB-generator-formatted nested lists with newline+indent between
+      // <li> tags cause adjacent slices to map to overlapping cleaned
+      // positions (outer's trailing "\n\n" maps to the same cleaned
+      // offset as inner's leading "\n\n"). The slice-emit must clamp the
+      // listItem's start to ctx.searchFrom rather than suppress, so every
+      // inner item emits. Reproduces the cpp20.epub TOC bug uncovered by
+      // Fix 1.
+      const html = '<html><body>'
+          '<h2>Heading</h2>'
+          '<nav><ol class="toc">\n'
+          '  <li>\n'
+          '    <a href="ch00.xhtml#x">Outer One</a>\n'
+          '    <ol>\n'
+          '      <li>\n'
+          '        <a href="ch00.xhtml#x1">Inner A</a>\n'
+          '      </li>\n'
+          '      <li>\n'
+          '        <a href="ch00.xhtml#x2">Inner B</a>\n'
+          '      </li>\n'
+          '      <li>\n'
+          '        <a href="ch00.xhtml#x3">Inner C</a>\n'
+          '      </li>\n'
+          '    </ol>\n'
+          '  </li>\n'
+          '</ol></nav>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final listItems = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList(growable: false);
+      // 4 listItems: Outer One + Inner A + Inner B + Inner C.
+      expect(listItems, hasLength(4));
+      // Strict monotonic: each block's end <= next block's start (after
+      // clamp, blocks are adjacent or non-overlapping).
+      for (var i = 1; i < listItems.length; i++) {
+        expect(listItems[i].start, greaterThanOrEqualTo(listItems[i - 1].end),
+            reason: 'listItem[$i] [${listItems[i].start}, '
+                '${listItems[i].end}) overlaps prior '
+                '[${listItems[i - 1].start}, ${listItems[i - 1].end})');
+      }
+    });
+
+    test('Fix 3 — leading empty inline element + block does not over-count '
+        'slice index (content-tracked, not element-presence)', () {
+      // Regression for codex round-7 MEDIUM: an empty <a></a> or an
+      // inline wrapper whose first content is a block must NOT advance
+      // the slice counter. Only actual non-ws TEXT advances hadContent.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters total here.</p>'
+          '<ol>'
+          '<li>'
+          '<a></a>'
+          '<p>BLOCK</p>'
+          'tail <code>uniqcode</code> end'
+          '</li>'
+          '</ol>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final listItems = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList(growable: false);
+      // Outer <li>'s only direct-text run is "tail uniqcode end" → 1
+      // listItem. Leading <a></a> (empty) and <p>BLOCK</p> emit blocks
+      // of their own (paragraph for <p>) but don't form an outer-li
+      // slice.
+      expect(listItems, hasLength(1));
+      // <code>uniqcode</code> mark must emit on this slice.
+      final monos = listItems.single.marks
+          .where((m) => m.type == InlineMarkType.monospace)
+          .toList();
+      expect(monos, hasLength(1),
+          reason: 'leading empty <a></a> must not advance slice counter; '
+              'trailing <code>uniqcode</code> stays in slice 0');
+      expect(monos.single.end - monos.single.start, 8);
+    });
+
+    test('Fix 3 — leading nested <ul>/<ol> before first text run does not '
+        'over-count slice index', () {
+      // Regression for codex round-6 MEDIUM: an <li> with a leading
+      // nested list (or block descendant) BEFORE any direct text doesn't
+      // form an elementRanges slice for the leading content. The slice
+      // counter must NOT advance for leading boundaries — only for
+      // boundaries crossed AFTER content. Without the hadContent guard,
+      // the trailing <code>uniqcode</code>'s slice index (0 in
+      // elementRanges) wouldn't match the walker's counter (1 after
+      // seeing the leading <ul>), and the mark would be silently dropped.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters total here.</p>'
+          '<ol>'
+          '<li>'
+          '<ul><li>nested item one</li><li>nested item two</li></ul>'
+          'tail <code>uniqcode</code> end'
+          '</li>'
+          '</ol>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final listItems = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList(growable: false);
+      // 2 inner listItems for "nested item one" / "two", plus 1 outer
+      // listItem covering "tail uniqcode end".
+      expect(listItems.length, greaterThanOrEqualTo(3));
+      // Locate the outer listItem by its <code>uniqcode</code> monospace
+      // mark (8 chars). Without the hadContent guard, the slice walker
+      // would over-count to slice 1 after the leading <ul> and skip
+      // emitting this mark.
+      final liWithUniqMark = listItems
+          .where(
+            (li) => li.marks.any(
+              (m) =>
+                  m.type == InlineMarkType.monospace &&
+                  m.end - m.start == 8,
+            ),
+          )
+          .toList(growable: false);
+      expect(liWithUniqMark, hasLength(1),
+          reason: 'outer <li>\'s slice 0 must carry the <code>uniqcode</code> '
+              'monospace mark; without the hadContent guard, the leading '
+              '<ul> would over-count to slice 1 and drop the mark');
+    });
+
+    test('Fix 3 — listItem bounds trim leading/trailing whitespace', () {
+      // The emitter's slice ranges include the surrounding "\n\n"
+      // block-separator whitespace. Without trimming at the builder
+      // level, every listItem renders as "\n\nPreface\n\n" in the
+      // mobile widget — producing huge vertical gaps in a list view.
+      // After trimming, listItem bounds describe SEMANTIC content
+      // only. Asserts:
+      //   - Each listItem's first and last char (within bounds) is
+      //     non-whitespace.
+      //   - listItem.end <= next listItem.start (gap = whitespace).
+      const html = '<html><body>'
+          '<h2>Heading</h2>'
+          '<nav><ol class="toc">\n'
+          '  <li><a href="#a">First Item</a></li>\n'
+          '  <li><a href="#b">Second Item</a></li>\n'
+          '  <li><a href="#c">Third Item</a></li>\n'
+          '</ol></nav>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '</body></html>';
+      final raw = extractStructured(html);
+      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
+      final plainText = cleaned.text;
+      final extraction = SectionExtraction(
+        extracted: cleaned,
+        sectionStartElement: null,
+        sectionEndElement: null,
+      );
+      final json = EpubStructuredContentBuilder.build(extraction);
+      final parsed = StructuredContent.tryParse(json);
+      expect(parsed, isNotNull);
+      final listItems = parsed!.annotations
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList(growable: false);
+      expect(listItems, hasLength(3));
+      // Every listItem's first and last char (within bounds) is
+      // non-whitespace.
+      bool isWs(int c) =>
+          c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D;
+      for (final li in listItems) {
+        expect(li.end, greaterThan(li.start));
+        expect(isWs(plainText.codeUnitAt(li.start)), isFalse,
+            reason: 'listItem at [${li.start}, ${li.end}) starts with '
+                'whitespace "${plainText[li.start]}"; bounds should be '
+                'trimmed');
+        expect(isWs(plainText.codeUnitAt(li.end - 1)), isFalse,
+            reason: 'listItem at [${li.start}, ${li.end}) ends with '
+                'whitespace; bounds should be trimmed');
+      }
+      // Adjacent listItems: gap between them is pure whitespace.
+      for (var i = 1; i < listItems.length; i++) {
+        expect(listItems[i].start, greaterThanOrEqualTo(listItems[i - 1].end));
+        for (var j = listItems[i - 1].end; j < listItems[i].start; j++) {
+          expect(isWs(plainText.codeUnitAt(j)), isTrue,
+              reason: 'gap char at offset $j between listItems must be '
+                  'whitespace');
+        }
+      }
+    });
+
+    test('Fix 3 — slice-internal block descendant skipped (composition)', () {
+      // <li>foo <a><p>BLOCK</p></a> bar <code>uniquetag</code></li>
+      // The <p> is wrapped in <a> (inline). The slice walker must skip
+      // <p> via isBlockElement(node) even though its parent is inline,
+      // AND the slice-counter must increment when crossing it (so the
+      // <code>uniquetag</code> in slice 2 is not matched against slice 1's
+      // text). Test asserts:
+      //   - 2 listItem blocks emit (split by <p>BLOCK</p>)
+      //   - <p>BLOCK</p> emits a separate paragraph block in DOM order
+      //   - The slice 2 listItem carries the <code>uniquetag</code>
+      //     monospace mark (length 9)
+      //   - The slice 1 listItem has NO monospace marks (the slice-counter
+      //     filter prevents misattribution)
+      //   - First-slice listMarker = '1.', second-slice listMarker = ''
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters total here.</p>'
+          '<ol><li>foo <a href="#"><p>BLOCK</p></a> bar '
+          '<code>uniquetag</code></li></ol>'
+          '</body></html>';
+      final blocks = buildFromFullPipeline(html);
+      final listItems = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
+      // 2 listItem blocks: one for "foo " (slice 1), one for " bar
+      // uniquetag" (slice 2).
+      expect(listItems, hasLength(2));
+      // First slice carries the marker.
+      expect(listItems[0].listMarker, '1.');
+      // Second slice has empty marker.
+      expect(listItems[1].listMarker, '');
+      // <p>BLOCK</p> emits a separate paragraph block in DOM order
+      // (between slice 1 and slice 2 of the listItem).
+      final blockParagraphs = blocks
+          .where((b) =>
+              b.type == ContentBlockType.paragraph &&
+              b.start >= listItems[0].end &&
+              b.end <= listItems[1].start)
+          .toList();
+      expect(blockParagraphs, isNotEmpty,
+          reason: '<p>BLOCK</p> should emit a paragraph block between '
+              'the two listItem slices');
+      // Slice 2 carries the monospace mark for <code>uniquetag</code>.
+      final slice2Monos = listItems[1].marks
+          .where((m) => m.type == InlineMarkType.monospace)
+          .toList();
+      expect(slice2Monos, hasLength(1));
+      expect(slice2Monos.single.end - slice2Monos.single.start, 9,
+          reason: '<code>uniquetag</code> is 9 chars');
+      // Slice 1 has no monospace marks (slice-counter filter prevents
+      // attributing slice-2's <code> to slice 1).
+      final slice1Monos = listItems[0].marks
+          .where((m) => m.type == InlineMarkType.monospace)
+          .toList();
+      expect(slice1Monos, isEmpty,
+          reason: 'slice 1 must not pick up slice 2\'s <code>uniquetag</code>');
+    });
+  });
 }

@@ -400,7 +400,7 @@ class EpubStructuredContentBuilder {
     _WalkContext ctx,
   ) {
     final ranges = ctx.elementRanges![li] ?? const <TextRange>[];
-    final state = _LiWalkState(ranges: ranges);
+    final state = _LiWalkState(li: li, ranges: ranges);
 
     // Recursive walker handles arbitrarily-deep inline wrappers around
     // block descendants — codex round-2 MEDIUM:
@@ -459,25 +459,293 @@ class EpubStructuredContentBuilder {
       if (!state.inDirectTextRun) {
         if (state.sliceIndex < state.ranges.length) {
           final slice = state.ranges[state.sliceIndex];
-          if (slice.start >= ctx.searchFrom) {
-            final marker = state.isFirstSlice
-                ? (isOrdered
-                    ? _markerForOrderedList(parentList, counter)
-                    : '•')
-                : '';
-            ctx.recordBlock(
-              ContentBlock(
-                type: ContentBlockType.listItem,
-                start: slice.start,
-                end: slice.end,
-                listMarker: marker,
-              ),
+          // The cleaner can map adjacent <li>'s leading-and-trailing
+          // formatting whitespace to OVERLAPPING cleaned positions
+          // (e.g. nested <ol> formatted with newline+indent: outer-li
+          // ends at the cleaned "\n\n", and inner-li-1 starts at the
+          // SAME cleaned "\n\n"). Suppressing on slice.start <
+          // ctx.searchFrom would drop every inner-li whose slice shares
+          // boundary whitespace with its predecessor — the bug exposed
+          // by Fix 1 in cpp20.epub TOC. Instead, clamp the block's
+          // start to ctx.searchFrom: the previous block "owned" the
+          // overlapping whitespace, but the new slice still has unique
+          // content past it.
+          //
+          // Edge case (acknowledged limit): if an inline element's
+          // text actually starts in the clamped-out region [slice.start,
+          // ctx.searchFrom) and that text re-appears past blockStart,
+          // _fuzzyIndexOf would find the LATER occurrence and emit a
+          // mark at the wrong location. Real-world EPUBs (cpp20,
+          // alicesAdventures, frankenstein) have only boundary
+          // whitespace in the overlap region — no inline elements live
+          // there — so this is not exercised in practice. Pathological
+          // constructed input could trigger it; document and revisit if
+          // a real EPUB surfaces the case.
+          final blockStart = slice.start < ctx.searchFrom
+              ? ctx.searchFrom
+              : slice.start;
+          final blockEnd = slice.end;
+          if (blockEnd > blockStart) {
+            // Trim leading/trailing whitespace from the block range. The
+            // emitter's slice ranges include the surrounding "\n\n"
+            // block-separator whitespace (cleaner-mapped from the
+            // formatted source HTML). If those bounds reach the renderer
+            // unmodified, every listItem renders as "\n\nPreface\n\n" —
+            // producing huge vertical gaps in a list view because the
+            // container widget ALSO provides item-spacing margin
+            // (compounding effect). Trim so blocks describe SEMANTIC
+            // content only; the renderer's container handles spacing.
+            final (trimmedStart, trimmedEnd) = _trimRangeWhitespace(
+              ctx.plainText,
+              blockStart,
+              blockEnd,
             );
+            if (trimmedEnd > trimmedStart) {
+              final marker = state.isFirstSlice
+                  ? (isOrdered
+                      ? _markerForOrderedList(parentList, counter)
+                      : '•')
+                  : '';
+              // Slice-bounded fuzzy match for inline marks within this <li>.
+              // Walks the whole <li> subtree but bounds matches to the
+              // TRIMMED slice — marks can't escape into the previous
+              // block's range OR into the trimmed-out boundary
+              // whitespace; marks for siblings in other slices (split
+              // off by block descendants like <p>BLOCK</p>) are
+              // rejected by Fix 2's reject-not-clamp guard. The walker
+              // skips nested <ul>/<ol> and block descendants so it only
+              // attempts matches for true inline children of this <li>.
+              final inlineMarks = _collectInlineMarksForSlice(
+                state.li,
+                TextRange(trimmedStart, trimmedEnd),
+                ctx.plainText,
+                state.sliceIndex,
+              );
+              ctx.recordBlock(
+                ContentBlock(
+                  type: ContentBlockType.listItem,
+                  start: trimmedStart,
+                  end: trimmedEnd,
+                  listMarker: marker,
+                  marks: inlineMarks,
+                ),
+              );
+              // Only flip isFirstSlice on a SUCCESSFUL emit. If the first
+              // slice is degenerate (fully overlapping with the previous
+              // block) and gets suppressed, we still want the next
+              // emitted slice to receive the list marker.
+              state.isFirstSlice = false;
+            }
           }
+          // Always advance the slice cursor — even on suppressed slice —
+          // so subsequent text runs pop the next slice.
           state.sliceIndex++;
-          state.isFirstSlice = false;
         }
         state.inDirectTextRun = true;
+      }
+    }
+  }
+
+  /// Collect inline marks for a single `<li>` slice. Walks [li]'s subtree
+  /// in DOM order, but only emits marks for inline elements that belong to
+  /// the [targetSliceIndex]-th slice — i.e. the inline elements that sit
+  /// in the contiguous direct-text run between the (targetSliceIndex)-th
+  /// and (targetSliceIndex+1)-th block-level descendant of [li].
+  ///
+  /// Walking the WHOLE `<li>` (rather than scoping to a per-slice DOM
+  /// subtree) is intentional — block descendants don't form a clean DOM
+  /// partition (a `<pre>` can sit anywhere in the subtree, including deep
+  /// inside `<a>`/`<span>` wrappers). A shared mutable counter
+  /// ([_SliceWalkCounter]) tracks the current slice index across the
+  /// whole walk; matches only fire when `counter.current == targetSliceIndex`.
+  /// Without this, codex round-5 found that a later-slice `<code>X</code>`
+  /// element could match its text against PLAIN TEXT in the current slice
+  /// (false-positive monospace mark on plain prose).
+  ///
+  /// Marks that overflow the slice's `end` are still rejected by
+  /// [_matchInlineMark]'s reject-not-clamp guard — defense in depth even
+  /// after the slice-membership filter.
+  static List<InlineMark> _collectInlineMarksForSlice(
+    dom.Element li,
+    TextRange slice,
+    String plainText,
+    int targetSliceIndex,
+  ) {
+    final marks = <InlineMark>[];
+    _walkSliceForMarks(
+      li,
+      plainText,
+      _MarkCursor(slice.start, slice.end),
+      marks,
+      insideCodeBlock: false,
+      isRoot: true,
+      targetSliceIndex: targetSliceIndex,
+      counter: _SliceWalkCounter(),
+    );
+    return marks;
+  }
+
+  /// Recursive walker for [_collectInlineMarksForSlice]. Mirrors
+  /// [_collectInlineMarks]'s cursor semantics but additionally:
+  /// - Skips nested `<ul>` / `<ol>` (each inner `<li>` emits its own
+  ///   listItem block elsewhere).
+  /// - Skips block descendants (except the root `<li>` itself) — they
+  ///   emit their own blocks via [_dispatchNode].
+  /// - Increments [counter.current] each time it crosses a block-level
+  ///   descendant or nested list, to track which slice the next inline
+  ///   element belongs to.
+  /// - Only attempts a match when `counter.current == targetSliceIndex`.
+  ///
+  /// `cursor` is mutated for sibling-cursor advance. Nested matched
+  /// elements get a FRESH inner cursor bounded to `(mark.start, mark.end)`,
+  /// so `<strong><code>X</code></strong>` emits both parent and nested
+  /// marks at correct offsets.
+  static void _walkSliceForMarks(
+    dom.Element e,
+    String plainText,
+    _MarkCursor cursor,
+    List<InlineMark> marks, {
+    required bool insideCodeBlock,
+    required bool isRoot,
+    required int targetSliceIndex,
+    required _SliceWalkCounter counter,
+  }) {
+    final tag = e.localName?.toLowerCase();
+    if (tag == null) return;
+    // Stop at nested lists — inner <li>s emit separate listItem blocks.
+    if (tag == 'ul' || tag == 'ol') return;
+    // Stop at block descendants (except the root <li> itself).
+    if (!isRoot && isBlockElement(e)) return;
+
+    for (final node in e.nodes) {
+      // Track text content so the slice counter advances correctly:
+      // leading blocks/nested-lists BEFORE any text don't form a slice
+      // in elementRanges, so they shouldn't advance the counter either.
+      if (node is dom.Text) {
+        if (_hasAsciiNonWs(node.text)) counter.hadContent = true;
+        continue;
+      }
+      if (node is! dom.Element) continue;
+      final ctag = node.localName?.toLowerCase();
+      if (ctag == null) continue;
+
+      // Block descendants and nested lists mark a slice boundary. Skip
+      // them in iteration (they emit elsewhere). Advance the slice
+      // counter ONLY if some content has been seen — leading blocks
+      // before any text don't form a slice in elementRanges.
+      if (ctag == 'ul' || ctag == 'ol') {
+        if (counter.hadContent) {
+          counter.current++;
+          counter.hadContent = false;
+        }
+        continue;
+      }
+      if (isBlockElement(node)) {
+        if (counter.hadContent) {
+          counter.current++;
+          counter.hadContent = false;
+        }
+        continue;
+      }
+
+      // Inline element. Don't preemptively mark content seen — an empty
+      // <a> or an inline wrapper whose first content is a block doesn't
+      // form a slice in elementRanges, so it shouldn't advance the
+      // counter. Instead, [counter.hadContent] is set only when actual
+      // non-whitespace TEXT is encountered during recursion (the
+      // dom.Text branch above). This mirrors the emitter's slice-record
+      // semantics (codex round-7 MEDIUM: presence of inline element is
+      // not equivalent to content; only text writes form a slice).
+      //
+      // Only attempt a match if we're currently in the target slice;
+      // otherwise still recurse so nested block descendants (e.g. inside
+      // <a>/<span> wrappers) advance the counter.
+      InlineMark? mark;
+      bool nestedInsideCodeBlock = insideCodeBlock;
+
+      if (counter.current == targetSliceIndex) {
+        if (ctag == 'strong' || ctag == 'b') {
+          mark = _matchInlineMark(
+            node,
+            plainText,
+            cursor.searchFrom,
+            cursor.searchEnd,
+            InlineMarkType.emphasis,
+            style: 'bold',
+          );
+        } else if (ctag == 'em' || ctag == 'i') {
+          mark = _matchInlineMark(
+            node,
+            plainText,
+            cursor.searchFrom,
+            cursor.searchEnd,
+            InlineMarkType.emphasis,
+            style: 'italic',
+          );
+        } else if (ctag == 'a') {
+          final href = node.attributes['href'];
+          if (href != null && href.startsWith('http')) {
+            mark = _matchInlineMark(
+              node,
+              plainText,
+              cursor.searchFrom,
+              cursor.searchEnd,
+              InlineMarkType.link,
+              url: href,
+            );
+          }
+        } else if (_isInlineMonospaceTag(ctag)) {
+          if (!insideCodeBlock) {
+            mark = _matchInlineMark(
+              node,
+              plainText,
+              cursor.searchFrom,
+              cursor.searchEnd,
+              InlineMarkType.monospace,
+            );
+          }
+          nestedInsideCodeBlock = true;
+        }
+      } else {
+        // Out of target slice: still suppress monospace inside code
+        // wrappers (semantic correctness for the recursion's
+        // insideCodeBlock flag).
+        if (_isInlineMonospaceTag(ctag)) {
+          nestedInsideCodeBlock = true;
+        }
+      }
+
+      if (mark != null) {
+        marks.add(mark);
+        // Recurse with inner cursor bounded to parent mark's range.
+        // Sibling cursor advances past parent after recursion returns.
+        final inner = _MarkCursor(mark.start, mark.end);
+        _walkSliceForMarks(
+          node,
+          plainText,
+          inner,
+          marks,
+          insideCodeBlock: nestedInsideCodeBlock,
+          isRoot: false,
+          targetSliceIndex: targetSliceIndex,
+          counter: counter,
+        );
+        cursor.searchFrom = mark.end;
+      } else {
+        // Always recurse — non-mark inline wrappers (<a> with relative
+        // href, <span>) carry mark-eligible descendants we must visit,
+        // AND any block descendants under inline wrappers must advance
+        // the slice counter even when we're out of the target slice.
+        _walkSliceForMarks(
+          node,
+          plainText,
+          cursor,
+          marks,
+          insideCodeBlock: nestedInsideCodeBlock,
+          isRoot: false,
+          targetSliceIndex: targetSliceIndex,
+          counter: counter,
+        );
       }
     }
   }
@@ -711,6 +979,33 @@ class EpubStructuredContentBuilder {
       if (c != 0x20 && c != 0x09 && c != 0x0A && c != 0x0D) return true;
     }
     return false;
+  }
+
+  /// Trim leading and trailing ASCII whitespace from `[start, end)` over
+  /// [plainText]. Returns the inner non-whitespace range. Used to strip
+  /// the surrounding "\n\n" block-separator whitespace from listItem
+  /// block bounds — the emitter's slices include them, but the renderer
+  /// doesn't want them (its container provides item spacing already).
+  /// If the entire range is whitespace, returns `(end, end)` (caller
+  /// should check for empty trimmed range).
+  static (int, int) _trimRangeWhitespace(
+    String plainText,
+    int start,
+    int end,
+  ) {
+    var s = start;
+    var e = end;
+    while (s < e) {
+      final c = plainText.codeUnitAt(s);
+      if (c != 0x20 && c != 0x09 && c != 0x0A && c != 0x0D) break;
+      s++;
+    }
+    while (e > s) {
+      final c = plainText.codeUnitAt(e - 1);
+      if (c != 0x20 && c != 0x09 && c != 0x0A && c != 0x0D) break;
+      e--;
+    }
+    return (s, e);
   }
 
   /// Compute the marker text for the [counter]-th item of an ordered list.
@@ -958,7 +1253,7 @@ class EpubStructuredContentBuilder {
     _collectInlineMarks(
       element,
       plainText,
-      idx,
+      _MarkCursor(idx, endIdx),
       marks,
       insideCodeBlock: insideCodeBlock,
     );
@@ -973,13 +1268,21 @@ class EpubStructuredContentBuilder {
   }
 
   /// Collect inline marks (emphasis, links, monospace) from element children.
-  /// [insideCodeBlock] is the ancestor flag — when true, inline `<code>` /
-  /// `<kbd>` etc. do NOT emit monospace marks (already covered by the
-  /// block-level monospace).
+  ///
+  /// [cursor] threads `searchFrom` (mutable; advances per emitted sibling
+  /// mark) and `searchEnd` (immutable hard bound — block range or parent
+  /// mark's range). [insideCodeBlock] is the ancestor flag — when true,
+  /// inline `<code>` / `<kbd>` etc. do NOT emit monospace marks (already
+  /// covered by the block-level monospace).
+  ///
+  /// Marks that would overflow `searchEnd` are REJECTED (return null), not
+  /// clamped — a 1-char monospace for a 30-char `<code>` would mis-render.
+  /// The cursor stays put on reject; subsequent siblings re-search from the
+  /// same start position.
   static void _collectInlineMarks(
     dom.Element element,
     String plainText,
-    int blockStart,
+    _MarkCursor cursor,
     List<InlineMark> marks, {
     required bool insideCodeBlock,
   }) {
@@ -989,84 +1292,82 @@ class EpubStructuredContentBuilder {
       final tag = node.localName?.toLowerCase();
       if (tag == null) continue;
 
+      InlineMark? mark;
+      bool nestedInsideCodeBlock = insideCodeBlock;
+
       if (tag == 'strong' || tag == 'b') {
-        final mark = _matchInlineMark(
+        mark = _matchInlineMark(
           node,
           plainText,
-          blockStart,
+          cursor.searchFrom,
+          cursor.searchEnd,
           InlineMarkType.emphasis,
           style: 'bold',
         );
-        if (mark != null) marks.add(mark);
-        // Recurse into the bold/italic for nested marks.
-        _collectInlineMarks(
-          node,
-          plainText,
-          blockStart,
-          marks,
-          insideCodeBlock: insideCodeBlock,
-        );
       } else if (tag == 'em' || tag == 'i') {
-        final mark = _matchInlineMark(
+        mark = _matchInlineMark(
           node,
           plainText,
-          blockStart,
+          cursor.searchFrom,
+          cursor.searchEnd,
           InlineMarkType.emphasis,
           style: 'italic',
-        );
-        if (mark != null) marks.add(mark);
-        _collectInlineMarks(
-          node,
-          plainText,
-          blockStart,
-          marks,
-          insideCodeBlock: insideCodeBlock,
         );
       } else if (tag == 'a') {
         final href = node.attributes['href'];
         if (href != null && href.startsWith('http')) {
-          final mark = _matchInlineMark(
+          mark = _matchInlineMark(
             node,
             plainText,
-            blockStart,
+            cursor.searchFrom,
+            cursor.searchEnd,
             InlineMarkType.link,
             url: href,
           );
-          if (mark != null) marks.add(mark);
         }
-        _collectInlineMarks(
-          node,
-          plainText,
-          blockStart,
-          marks,
-          insideCodeBlock: insideCodeBlock,
-        );
       } else if (_isInlineMonospaceTag(tag)) {
         if (!insideCodeBlock) {
-          final mark = _matchInlineMark(
+          mark = _matchInlineMark(
             node,
             plainText,
-            blockStart,
+            cursor.searchFrom,
+            cursor.searchEnd,
             InlineMarkType.monospace,
           );
-          if (mark != null) marks.add(mark);
         }
-        // Recurse with insideCodeBlock=true so nested marks know not to
-        // double-emit monospace, but bold/italic inside <code> still emit.
+        // Suppress nested monospace either way — even if the outer
+        // <code> didn't emit a mark (out of bounds, etc.), nested
+        // <code>s shouldn't double-emit.
+        nestedInsideCodeBlock = true;
+      }
+
+      if (mark != null) {
+        marks.add(mark);
+        // Children of a matched element search inside its range.
+        // Degenerate truly-nested same-text (`<strong>foo<strong>foo
+        // </strong></strong>`) emits inner mark at outer mark.start —
+        // accepted limit of fuzzy-match path; pathological in practice.
+        final inner = _MarkCursor(mark.start, mark.end);
         _collectInlineMarks(
           node,
           plainText,
-          blockStart,
+          inner,
           marks,
-          insideCodeBlock: true,
+          insideCodeBlock: nestedInsideCodeBlock,
         );
+        cursor.searchFrom = mark.end;
       } else {
+        // Unmatched / non-mark wrapper: recurse with parent cursor
+        // unchanged so descendants can still emit. Cursor stays put on
+        // reject — if a sibling has the same text, it re-searches from
+        // the same start; if duplicates exist in the bound, they emit
+        // at their actual occurrence (cursor advances as marks accumulate).
         _collectInlineMarks(
           node,
           plainText,
-          blockStart,
+          cursor,
           marks,
-          insideCodeBlock: insideCodeBlock,
+          insideCodeBlock: nestedInsideCodeBlock,
         );
       }
     }
@@ -1078,10 +1379,19 @@ class EpubStructuredContentBuilder {
   }
 
   /// Match an inline element's text to a range in the plain text.
+  ///
+  /// Returns null when:
+  /// - element text is empty after trim/normalize, or
+  /// - `searchFrom >= searchEnd` (cursor exhausted), or
+  /// - no fuzzy match found within `[searchFrom, searchEnd)`, or
+  /// - `_findMatchLength` extends past `searchEnd` (overflow rejection —
+  ///   "no mark > wrong-length mark"), or
+  /// - the matched length is zero.
   static InlineMark? _matchInlineMark(
     dom.Element element,
     String plainText,
     int searchFrom,
+    int searchEnd,
     InlineMarkType type, {
     String? style,
     String? url,
@@ -1091,12 +1401,18 @@ class EpubStructuredContentBuilder {
 
     final normalized = _normalizeForMatch(text);
     if (normalized.isEmpty) return null;
+    if (searchFrom >= searchEnd) return null;
 
     final idx = _fuzzyIndexOf(plainText, normalized, searchFrom);
-    if (idx < 0) return null;
+    if (idx < 0 || idx >= searchEnd) return null;
 
-    final endIdx = (idx + _findMatchLength(plainText, idx, normalized))
-        .clamp(idx + 1, plainText.length);
+    final matchLen = _findMatchLength(plainText, idx, normalized);
+    final endIdx = idx + matchLen;
+
+    // REJECT (don't clamp) marks that overflow the bound. A truncated mark
+    // would mis-render. Acceptable trade-off: "no mark" > "wrong-length mark".
+    if (endIdx > searchEnd) return null;
+    if (endIdx <= idx) return null;
 
     return InlineMark(
       type: type,
@@ -1239,14 +1555,51 @@ class _WalkContext {
 /// while walking a single `<li>`'s subtree (text + inline elements + nested
 /// blocks). Consolidates the slice-pop cursor + run-mode flag so the
 /// recursive walker can update them via shared reference.
+///
+/// `li` is captured so the slice-emit site can pass it to the inline-mark
+/// helper without re-threading it through every recursive call.
 class _LiWalkState {
+  final dom.Element li;
   final List<TextRange> ranges;
   int sliceIndex;
   bool isFirstSlice;
   bool inDirectTextRun;
 
-  _LiWalkState({required this.ranges})
+  _LiWalkState({required this.li, required this.ranges})
       : sliceIndex = 0,
         isFirstSlice = true,
         inDirectTextRun = false;
+}
+
+/// Mutable cursor threaded through [EpubStructuredContentBuilder._collectInlineMarks]
+/// and [EpubStructuredContentBuilder._walkSliceForMarks]. `searchFrom`
+/// advances per emitted sibling mark; `searchEnd` is an immutable hard bound
+/// (the enclosing block or parent mark's range). Marks whose match would
+/// overflow `searchEnd` are rejected, not clamped.
+class _MarkCursor {
+  int searchFrom;
+  final int searchEnd;
+  _MarkCursor(this.searchFrom, this.searchEnd);
+}
+
+/// Mutable counter shared across an [EpubStructuredContentBuilder._walkSliceForMarks]
+/// invocation. Tracks which slice index of the enclosing `<li>` the walker
+/// is currently in.
+///
+/// Slice indexing must mirror the emitter's `elementRanges[li]`: a slice
+/// is only RECORDED when its direct-text run has non-whitespace content
+/// (whitespace-only slices are dropped). So [current] must only advance
+/// when a block-level descendant or nested `<ul>`/`<ol>` is crossed AFTER
+/// non-whitespace TEXT has been seen in the current slice. Leading
+/// blocks before any text don't form a slice; an empty `<a>` or an inline
+/// wrapper whose first content is a block also doesn't form a slice
+/// (codex rounds 6+7).
+///
+/// [hadContent] is set ONLY by encountering a `dom.Text` node with
+/// non-whitespace content (mirrors the emitter's `writeText` →
+/// `sliceHasNonWs` flag). Inline element presence alone does NOT
+/// imply content — the recursion's text descendants do.
+class _SliceWalkCounter {
+  int current = 0;
+  bool hadContent = false;
 }
