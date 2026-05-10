@@ -400,7 +400,7 @@ class EpubStructuredContentBuilder {
     _WalkContext ctx,
   ) {
     final ranges = ctx.elementRanges![li] ?? const <TextRange>[];
-    final state = _LiWalkState(li: li, ranges: ranges);
+    final state = _LiWalkState(li: li, depth: _liDepth(li), ranges: ranges);
 
     // Recursive walker handles arbitrarily-deep inline wrappers around
     // block descendants — codex round-2 MEDIUM:
@@ -527,6 +527,7 @@ class EpubStructuredContentBuilder {
                   start: trimmedStart,
                   end: trimmedEnd,
                   listMarker: marker,
+                  depth: state.depth,
                   marks: inlineMarks,
                 ),
               );
@@ -1006,6 +1007,25 @@ class EpubStructuredContentBuilder {
       e--;
     }
     return (s, e);
+  }
+
+  /// Count `<li>` ancestors of [li] in its DOM tree. The emitting `<li>` is
+  /// not counted, so a top-level `<li>` returns 0, the first nested `<li>`
+  /// returns 1, etc.
+  ///
+  /// This is the depth value carried on `ContentBlock.depth` for the
+  /// renderer's visual indent. Computing depth from DOM ancestry at the
+  /// emission site (rather than threading a parameter through every
+  /// dispatcher) is robust to nested lists wrapped in non-list block
+  /// containers (e.g. `<li><div><ul><li>Inner</li></ul></div></li>`),
+  /// which reach `_handleLi` via `_dispatchNode` →
+  /// `_recurseIntoBlockContainer` → `_walkBlocks`.
+  static int _liDepth(dom.Element li) {
+    var n = 0;
+    for (var p = li.parent; p != null; p = p.parent) {
+      if (p.localName?.toLowerCase() == 'li') n++;
+    }
+    return n;
   }
 
   /// Compute the marker text for the [counter]-th item of an ordered list.
@@ -1558,15 +1578,27 @@ class _WalkContext {
 ///
 /// `li` is captured so the slice-emit site can pass it to the inline-mark
 /// helper without re-threading it through every recursive call.
+///
+/// `depth` is the count of `<li>` ancestors of [li] in the source DOM,
+/// computed once at `_handleLi` entry. It feeds `ContentBlock.depth` so
+/// the renderer can visually indent nested list items. The DOM-ancestor
+/// approach (vs. threading a parameter through every dispatcher) is robust
+/// to nested lists wrapped in non-list block containers (e.g.
+/// `<li><div><ul>...</ul></div></li>`), which reach `_handleLi` via
+/// `_dispatchNode` → `_recurseIntoBlockContainer` → `_walkBlocks`.
 class _LiWalkState {
   final dom.Element li;
+  final int depth;
   final List<TextRange> ranges;
   int sliceIndex;
   bool isFirstSlice;
   bool inDirectTextRun;
 
-  _LiWalkState({required this.li, required this.ranges})
-      : sliceIndex = 0,
+  _LiWalkState({
+    required this.li,
+    required this.depth,
+    required this.ranges,
+  })  : sliceIndex = 0,
         isFirstSlice = true,
         inDirectTextRun = false;
 }

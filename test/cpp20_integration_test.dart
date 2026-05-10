@@ -236,6 +236,33 @@ void main() {
             seen.add(key);
           }
         }
+
+        // (h) Nesting depth: cpp20 TOC has 3-level nested <ol> for chapters.
+        // Top-level chapters (e.g. "1. Comparisons …") have depth 0,
+        // mid-tier sections (e.g. "1.1 Motivation …") have depth 1, and
+        // sub-subsections (e.g. "1.1.1 Defining …") have depth 2.
+        final depthHistogram = <int, int>{};
+        for (final li in listItems) {
+          depthHistogram[li.depth] = (depthHistogram[li.depth] ?? 0) + 1;
+        }
+        expect(depthHistogram[0] ?? 0, greaterThan(0),
+            reason: 'expected at least one depth-0 listItem in cpp20 TOC');
+        expect(depthHistogram[1] ?? 0, greaterThan(0),
+            reason: 'expected at least one depth-1 listItem in cpp20 TOC '
+                '(e.g. "1.1 Motivation for Operator<=>")');
+        expect(depthHistogram[2] ?? 0, greaterThan(0),
+            reason: 'expected at least one depth-2 listItem in cpp20 TOC '
+                '(e.g. "1.1.1 Defining Comparison Operators Before C++20")');
+
+        // The "1.1.1" entry verified above must have depth 2.
+        final defining111 = listItems.where((li) {
+          final txt = plainText.substring(li.start, li.end);
+          return txt.contains('1.1.1 Defining Comparison Operators Before');
+        }).toList(growable: false);
+        expect(defining111, isNotEmpty,
+            reason: 'cpp20 TOC must contain "1.1.1 Defining …" entry');
+        expect(defining111.first.depth, 2,
+            reason: '"1.1.1 Defining …" must have depth 2 (3-level nested ol)');
       });
 
       test('block multiset summary (structural snapshot)', () {

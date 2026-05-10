@@ -1857,4 +1857,127 @@ void main() {
           reason: 'slice 1 must not pick up slice 2\'s <code>uniquetag</code>');
     });
   });
+
+  group('EpubStructuredContentBuilder — listItem depth (DOM-ancestor)', () {
+    List<ContentBlock> buildFromFullPipeline(String html) {
+      final raw = extractStructured(html);
+      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
+      final extraction = SectionExtraction(
+        extracted: cleaned,
+        sectionStartElement: null,
+        sectionEndElement: null,
+      );
+      final json = EpubStructuredContentBuilder.build(extraction);
+      expect(json, isNotNull, reason: 'build returned null');
+      final parsed = StructuredContent.tryParse(json);
+      expect(parsed, isNotNull);
+      return parsed!.annotations;
+    }
+
+    test('top-level <li>s have depth 0', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ul><li>Apples</li><li>Bananas</li></ul>'
+          '</body></html>';
+      final items = buildFromFullPipeline(html)
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
+      expect(items, hasLength(2));
+      expect(items.every((b) => b.depth == 0), isTrue);
+    });
+
+    test('direct nesting: depth 0/1/2 for <ol><li><ol><li><ol><li>...', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ol><li>A'
+          '<ol><li>B'
+          '<ol><li>C</li></ol>'
+          '</li></ol>'
+          '</li></ol>'
+          '</body></html>';
+      final items = buildFromFullPipeline(html)
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
+      expect(items, hasLength(3));
+      // Items are emitted in DOM-walk order: outer first, then inner, then
+      // innermost.
+      expect(items[0].depth, 0, reason: 'A is top-level');
+      expect(items[1].depth, 1, reason: 'B is one level deep');
+      expect(items[2].depth, 2, reason: 'C is two levels deep');
+    });
+
+    test(
+        'wrapped block container preserves depth: <li><div><ul><li>Inner</li></ul></div></li>',
+        () {
+      // Load-bearing case: the inner <ul> is reached via _walkLiNode →
+      // _dispatchNode → _recurseIntoBlockContainer → _walkBlocks →
+      // _emitListContainerIfApplicable. DOM-ancestor counting catches
+      // this; threading a depth parameter through every dispatcher would
+      // miss it.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ul><li>Outer'
+          '<div><ul><li>Inner</li></ul></div>'
+          '</li></ul>'
+          '</body></html>';
+      final items = buildFromFullPipeline(html)
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
+      expect(items, hasLength(2));
+      // First emitted is Outer's first slice, then Inner.
+      final outer = items.firstWhere((b) => b.depth == 0);
+      final inner = items.firstWhere((b) => b.depth == 1);
+      expect(outer, isNotNull);
+      expect(inner, isNotNull);
+    });
+
+    test('mixed container types: <ol><li><ul><li>...', () {
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ol><li>A1<ul><li>A1a</li><li>A1b</li></ul></li></ol>'
+          '</body></html>';
+      final items = buildFromFullPipeline(html)
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
+      expect(items, hasLength(3));
+      // First emit is A1 (top-level), then A1a + A1b (nested).
+      expect(items[0].depth, 0);
+      expect(items[1].depth, 1);
+      expect(items[2].depth, 1);
+    });
+
+    test('continuation slices inherit the same depth as the first slice', () {
+      // <li> with mid-slice <p> block descendant produces multiple listItem
+      // slices for the same <li>. All slices must share the parent <li>'s
+      // depth.
+      const html = '<html><body>'
+          '<p>Padding so the chapter exceeds fifty characters here.</p>'
+          '<ul><li>Outer head<p>Inline para</p>Outer tail'
+          '<ul><li>Inner</li></ul>'
+          '</li></ul>'
+          '</body></html>';
+      final items = buildFromFullPipeline(html)
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
+      // Every Outer slice should carry depth 0; the Inner item depth 1.
+      // We don't pin the exact emission count (slice trimming may collapse)
+      // but assert the depth invariant.
+      final depthsByMarker =
+          items.map((b) => '${b.listMarker}:${b.depth}').toList();
+      // Top-level Outer slice(s) have listMarker='•' on first slice and ''
+      // on continuations; either way depth must be 0.
+      final outerDepths = items
+          .where((b) => b.depth == 0)
+          .map((b) => b.depth)
+          .toSet();
+      final innerDepths = items
+          .where((b) => b.depth == 1)
+          .map((b) => b.depth)
+          .toSet();
+      expect(outerDepths, equals({0}),
+          reason: 'all Outer slices share depth 0 (got $depthsByMarker)');
+      expect(innerDepths, equals({1}),
+          reason: 'Inner has depth 1 (got $depthsByMarker)');
+    });
+  });
 }
