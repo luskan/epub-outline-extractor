@@ -14,6 +14,38 @@ import 'text_parsing_utils.dart';
 /// and the starting element is not itself a heading.
 const _defaultHeadingLevel = 2;
 
+/// Find an element matching an EPUB href fragment by `id` or `name`.
+///
+/// EPUB fragment IDs frequently contain characters that are invalid in a
+/// CSS ident — Google Docs exports commonly produce IDs like
+/// `h.9ugsminh1ia2`, which `querySelector('#h.9ugsminh1ia2')` parses as id
+/// `h` followed by class `9ugsminh1ia2` and rejects with `FormatException`
+/// (digit-led class). The Dart `html` package's selector parser also
+/// can't handle CSS string escapes inside `[id="..."]`, so we sidestep
+/// CSS entirely and walk the DOM matching the raw attribute value.
+/// Returns the first descendant whose `id` matches; if none, the first
+/// whose `name` matches.
+dom.Element? findElementByFragmentId(dom.Document document, String fragmentId) {
+  final root = document.documentElement ?? document.body;
+  if (root == null) return null;
+  dom.Element? byName;
+  for (final e in _descendantElements(root)) {
+    if (e.attributes['id'] == fragmentId) return e;
+    if (byName == null && e.attributes['name'] == fragmentId) {
+      byName = e;
+    }
+  }
+  return byName;
+}
+
+/// Pre-order DFS over `root` and all descendant elements, including `root`.
+Iterable<dom.Element> _descendantElements(dom.Element root) sync* {
+  yield root;
+  for (final child in root.children) {
+    yield* _descendantElements(child);
+  }
+}
+
 /// Extract text from HTML content, removing scripts and styles.
 ///
 /// [htmlContent] - Raw HTML content.
@@ -93,9 +125,7 @@ String extractSectionText(
   }
 
   // Case 2: Find start element by fragment ID
-  final startElement =
-      document.querySelector('#$fragmentId') ??
-      document.querySelector('[name="$fragmentId"]');
+  final startElement = findElementByFragmentId(document, fragmentId);
 
   if (startElement == null) {
     logger?.call('    WARNING: Fragment ID "$fragmentId" not found in HTML!');
@@ -146,8 +176,7 @@ SectionExtraction extractSectionStructured(
 
   if (fragmentId == null) {
     if (nextFragmentId != null) {
-      endElement = document.querySelector('#$nextFragmentId') ??
-          document.querySelector('[name="$nextFragmentId"]');
+      endElement = findElementByFragmentId(document, nextFragmentId);
       _extractUntilElement(document, nextFragmentId, emitter, logger);
     } else {
       // Walk body only — matches [extractStructured]. Walking the whole
@@ -166,12 +195,10 @@ SectionExtraction extractSectionStructured(
       emitter.syncCaption(null);
     }
   } else {
-    startElement = document.querySelector('#$fragmentId') ??
-        document.querySelector('[name="$fragmentId"]');
+    startElement = findElementByFragmentId(document, fragmentId);
     if (startElement != null) {
       if (nextFragmentId != null) {
-        endElement = document.querySelector('#$nextFragmentId') ??
-            document.querySelector('[name="$nextFragmentId"]');
+        endElement = findElementByFragmentId(document, nextFragmentId);
       }
       _extractFromElement(
         document,
@@ -287,9 +314,7 @@ void _extractUntilElement(
   _StructuredEmitter emitter,
   void Function(String)? logger,
 ) {
-  final endElement =
-      document.querySelector('#$elementId') ??
-      document.querySelector('[name="$elementId"]');
+  final endElement = findElementByFragmentId(document, elementId);
 
   if (endElement == null) {
     logger?.call(

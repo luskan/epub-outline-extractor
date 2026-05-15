@@ -211,6 +211,170 @@ void main() {
       expect(result, contains('Subsection content'));
       expect(result, isNot(contains('Chapter 2 content')));
     });
+
+    // Regression: Google Docs and other authoring tools emit fragment IDs
+    // like `h.9ugsminh1ia2` where the `.` would be interpreted as a CSS
+    // class separator and the digit-led tail would fail ident parsing.
+    test('extracts section for fragment id containing a dot', () {
+      const html = '''
+<html><body>
+<h2 id="h.9ugsminh1ia2">Intro</h2>
+<p>Intro text</p>
+<h2 id="h.another1id">Chapter 1</h2>
+<p>Chapter 1 text</p>
+</body></html>
+''';
+
+      final result =
+          extractSectionText(html, 'h.9ugsminh1ia2', 'h.another1id');
+
+      expect(result, contains('Intro text'));
+      expect(result, isNot(contains('Chapter 1 text')));
+    });
+
+    test('extracts section for fragment id starting with a digit', () {
+      const html = '''
+<html><body>
+<h2 id="1stsection">First</h2>
+<p>First text</p>
+<h2 id="2ndsection">Second</h2>
+<p>Second text</p>
+</body></html>
+''';
+
+      final result = extractSectionText(html, '1stsection', '2ndsection');
+
+      expect(result, contains('First text'));
+      expect(result, isNot(contains('Second text')));
+    });
+
+    test('handles fragment id with colon (XML-style)', () {
+      const html = '''
+<html><body>
+<h2 id="ns:section1">First</h2>
+<p>First text</p>
+<h2 id="ns:section2">Second</h2>
+<p>Second text</p>
+</body></html>
+''';
+
+      final result = extractSectionText(html, 'ns:section1', 'ns:section2');
+
+      expect(result, contains('First text'));
+      expect(result, isNot(contains('Second text')));
+    });
+  });
+
+  group('findElementByFragmentId', () {
+    test('finds element by id with dot in name', () {
+      final doc = html_parser.parse(
+        '<html><body><h2 id="h.9ugsminh1ia2">Hi</h2></body></html>',
+      );
+      final el = findElementByFragmentId(doc, 'h.9ugsminh1ia2');
+      expect(el, isNotNull);
+      expect(el!.localName, 'h2');
+    });
+
+    test('finds element by id starting with a digit', () {
+      final doc = html_parser.parse(
+        '<html><body><h2 id="9ugsminh1ia2">Hi</h2></body></html>',
+      );
+      final el = findElementByFragmentId(doc, '9ugsminh1ia2');
+      expect(el, isNotNull);
+    });
+
+    test('falls back to name attribute when id is absent', () {
+      final doc = html_parser.parse(
+        '<html><body><a name="legacy.anchor"></a><p>x</p></body></html>',
+      );
+      final el = findElementByFragmentId(doc, 'legacy.anchor');
+      expect(el, isNotNull);
+      expect(el!.localName, 'a');
+    });
+
+    test('returns null for missing fragment', () {
+      final doc = html_parser.parse('<html><body><p>nothing</p></body></html>');
+      expect(findElementByFragmentId(doc, 'h.missing'), isNull);
+    });
+
+    test('does not throw on ids containing CSS-special characters', () {
+      final doc = html_parser.parse(
+        '<html><body><span id="weird-:.0id"></span></body></html>',
+      );
+      expect(
+        () => findElementByFragmentId(doc, 'weird-:.0id'),
+        returnsNormally,
+      );
+      expect(findElementByFragmentId(doc, 'weird-:.0id'), isNotNull);
+    });
+
+    test('handles ids containing a double-quote', () {
+      final doc = html_parser.parse(
+        '<html><body><span id=\'has"quote\'></span></body></html>',
+      );
+      expect(findElementByFragmentId(doc, 'has"quote'), isNotNull);
+    });
+
+    test('handles ids containing a backslash', () {
+      final doc = html_parser.parse(
+        '<html><body><span id="back\\slash"></span></body></html>',
+      );
+      expect(findElementByFragmentId(doc, r'back\slash'), isNotNull);
+    });
+
+    // Locks the trickiest semantic of the helper: even if a matching `name`
+    // attribute appears earlier in document order, a later element with a
+    // matching `id` must still win — matching the legacy
+    // `querySelector('#x') ?? querySelector('[name="x"]')` priority.
+    test('prefers id even when name appears earlier in document', () {
+      final doc = html_parser.parse(
+        '<html><body><a name="x"></a><p id="x">Real</p></body></html>',
+      );
+      final el = findElementByFragmentId(doc, 'x');
+      expect(el, isNotNull);
+      expect(el!.localName, 'p');
+    });
+
+    test('matches an id placed on the <html> root element', () {
+      final doc = html_parser.parse(
+        '<html id="h.rooty"><body><p>x</p></body></html>',
+      );
+      final el = findElementByFragmentId(doc, 'h.rooty');
+      expect(el, isNotNull);
+      expect(el!.localName, 'html');
+    });
+
+    test('first occurrence wins for duplicate ids', () {
+      final doc = html_parser.parse(
+        '<html><body>'
+        '<p id="dup">first</p>'
+        '<p id="dup">second</p>'
+        '</body></html>',
+      );
+      final el = findElementByFragmentId(doc, 'dup');
+      expect(el, isNotNull);
+      expect(el!.text, 'first');
+    });
+  });
+
+  // Locks the null-fragment + special-char nextFragment path used when the
+  // TOC binds a chapter to "from start until this anchor" (codex review).
+  group('extractSectionStructured null-fragment + special-char endpoint', () {
+    test('respects dot-bearing nextFragmentId boundary', () {
+      const html = '''
+<html><body>
+<p>Leading text.</p>
+<h2 id="h.9ugsminh1ia2">Boundary</h2>
+<p>Should not be included.</p>
+</body></html>
+''';
+      final result = extractSectionStructured(html, null, 'h.9ugsminh1ia2');
+      final text = result.extracted.text;
+      expect(text, contains('Leading text'));
+      expect(text, isNot(contains('Should not be included')));
+      expect(result.sectionEndElement, isNotNull);
+      expect(result.sectionEndElement!.localName, 'h2');
+    });
   });
 
   group('getHeadingLevel', () {
