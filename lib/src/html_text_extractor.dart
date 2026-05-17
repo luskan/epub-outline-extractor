@@ -114,7 +114,13 @@ String extractSectionText(
         '    Extracting from beginning until fragment: $nextFragmentId',
       );
       final emitter = _StructuredEmitter();
-      _extractUntilElement(document, nextFragmentId, emitter, logger);
+      _extractUntilElement(
+        document,
+        nextFragmentId,
+        emitter,
+        logger,
+        root: document.body,
+      );
       return cleanExtractedText(emitter.text);
     }
     // No fragments at all - this is likely the entire chapter
@@ -138,13 +144,7 @@ String extractSectionText(
 
   // Case 3: Extract from fragment to next fragment or heading
   final emitter = _StructuredEmitter();
-  _extractFromElement(
-    document,
-    startElement,
-    nextFragmentId,
-    emitter,
-    logger,
-  );
+  _extractFromElement(document, startElement, nextFragmentId, emitter, logger);
   return cleanExtractedText(emitter.text);
 }
 
@@ -177,7 +177,13 @@ SectionExtraction extractSectionStructured(
   if (fragmentId == null) {
     if (nextFragmentId != null) {
       endElement = findElementByFragmentId(document, nextFragmentId);
-      _extractUntilElement(document, nextFragmentId, emitter, logger);
+      _extractUntilElement(
+        document,
+        nextFragmentId,
+        emitter,
+        logger,
+        root: document.body,
+      );
     } else {
       // Walk body only — matches [extractStructured]. Walking the whole
       // document would leak `<head><title>` text into plainText.
@@ -312,8 +318,9 @@ void _extractUntilElement(
   dom.Document document,
   String elementId,
   _StructuredEmitter emitter,
-  void Function(String)? logger,
-) {
+  void Function(String)? logger, {
+  dom.Node? root,
+}) {
   final endElement = findElementByFragmentId(document, elementId);
 
   if (endElement == null) {
@@ -377,7 +384,7 @@ void _extractUntilElement(
     }
   }
 
-  walkNodes(document);
+  walkNodes(root ?? document);
   // Close any still-open li / dt-dd / table / caption state at end of walk.
   emitter.syncDirectLi(null);
   emitter.syncDtDd(null);
@@ -437,8 +444,7 @@ void _extractFromElement(
   dom.Element? findFigcaptionAncestor(dom.Node? node) {
     var cur = node;
     while (cur != null) {
-      if (cur is dom.Element &&
-          cur.localName?.toLowerCase() == 'figcaption') {
+      if (cur is dom.Element && cur.localName?.toLowerCase() == 'figcaption') {
         return cur;
       }
       cur = cur.parent;
@@ -994,8 +1000,7 @@ class _StructuredEmitter {
     if (_inPreserveMode) {
       // Preserve verbatim, with tab→4-space normalisation and \r dropped.
       // Plan §5.3.
-      final normalised =
-          text.replaceAll('\t', '    ').replaceAll('\r', '');
+      final normalised = text.replaceAll('\t', '    ').replaceAll('\r', '');
       _buffer.write(normalised);
     } else {
       _buffer.write(text);
@@ -1121,8 +1126,10 @@ class _StructuredEmitter {
     _pendingOpenCaption = newCaption;
     _currentCaption = newCaption;
     if (newCaption != null) {
-      final frame =
-          _captionFrames.putIfAbsent(newCaption, () => _CaptionFrame());
+      final frame = _captionFrames.putIfAbsent(
+        newCaption,
+        () => _CaptionFrame(),
+      );
       frame.pendingOpen = true;
     }
   }
@@ -1235,9 +1242,7 @@ class _StructuredEmitter {
         final preservedSpan = _preserveStack.removeAt(i);
         final preservedEnd = _buffer.length;
         if (preservedEnd > preservedSpan.startPos) {
-          _preservedRanges.add(
-            TextRange(preservedSpan.startPos, preservedEnd),
-          );
+          _preservedRanges.add(TextRange(preservedSpan.startPos, preservedEnd));
         }
         break;
       }

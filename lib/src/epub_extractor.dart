@@ -336,6 +336,7 @@ class EpubExtractor {
     // matching legacy `_extractSectionsFromToc` behavior where the
     // skipped parent's children kept being processed independently.
     final flatBookSections = <BookSection?>[];
+    final documentTitleWrapperIndexes = <int>{};
 
     BookSection virtualPlaceholder(String title) => BookSection(
       title: title,
@@ -348,8 +349,9 @@ class EpubExtractor {
 
       if (tocItem.href == null) {
         _logger.fine('SKIPPED: "${tocItem.title}" - no href');
-        flatBookSections
-            .add(tocItem.depth == 0 ? virtualPlaceholder(tocItem.title) : null);
+        flatBookSections.add(
+          tocItem.depth == 0 ? virtualPlaceholder(tocItem.title) : null,
+        );
         continue;
       }
 
@@ -357,11 +359,21 @@ class EpubExtractor {
 
       final chapterIndex = chapters.indexWhere((ch) => ch.name == file);
       if (chapterIndex == -1) {
-        _logger.fine(
-          'SKIPPED: "${tocItem.title}" - chapter not found: $file',
+        _logger.fine('SKIPPED: "${tocItem.title}" - chapter not found: $file');
+        flatBookSections.add(
+          tocItem.depth == 0 ? virtualPlaceholder(tocItem.title) : null,
         );
-        flatBookSections
-            .add(tocItem.depth == 0 ? virtualPlaceholder(tocItem.title) : null);
+        continue;
+      }
+
+      if (_isDocumentTitleWrapper(
+        tocItem,
+        documentTitle: epubBook.title,
+        fragment: fragment,
+      )) {
+        _logger.fine('SKIPPED: "${tocItem.title}" - document-title wrapper');
+        documentTitleWrapperIndexes.add(i);
+        flatBookSections.add(virtualPlaceholder(tocItem.title));
         continue;
       }
 
@@ -413,8 +425,9 @@ class EpubExtractor {
               logger: _logger.fine,
             );
           }
-          final cleaned =
-              TextCleaner.cleanExtractedTextRespectingRanges(raw.extracted);
+          final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(
+            raw.extracted,
+          );
           sectionText = cleaned.text;
           structuredExtraction = SectionExtraction(
             extracted: cleaned,
@@ -508,7 +521,9 @@ class EpubExtractor {
         if (child != null) children.add(child);
       }
 
-      if (children.isEmpty) {
+      if (documentTitleWrapperIndexes.contains(i)) {
+        result.addAll(children);
+      } else if (children.isEmpty) {
         result.add(parentSection);
       } else {
         result.add(parentSection.copyWith(subsections: children));
@@ -559,6 +574,23 @@ class EpubExtractor {
     return lower.endsWith('.html') ||
         lower.endsWith('.xhtml') ||
         lower.endsWith('.htm');
+  }
+
+  bool _isDocumentTitleWrapper(
+    TocItemFlat tocItem, {
+    required String? documentTitle,
+    required String? fragment,
+  }) {
+    if (tocItem.depth != 0 || !tocItem.isSection || fragment != null) {
+      return false;
+    }
+    final normalizedDocumentTitle = _normalizeTitle(documentTitle);
+    if (normalizedDocumentTitle.isEmpty) return false;
+    return _normalizeTitle(tocItem.title) == normalizedDocumentTitle;
+  }
+
+  String _normalizeTitle(String? value) {
+    return (value ?? '').trim().replaceAll(RegExp(r'\s+'), ' ').toLowerCase();
   }
 
   int _countChapters(List<EpubChapter> chapters) {

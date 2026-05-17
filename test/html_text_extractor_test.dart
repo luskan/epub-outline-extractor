@@ -113,8 +113,7 @@ void main() {
     });
 
     test('skips empty headings', () {
-      const html =
-          '<html><body><h1>  </h1><h2>Real Title</h2></body></html>';
+      const html = '<html><body><h1>  </h1><h2>Real Title</h2></body></html>';
 
       final result = extractTitleFromHtml(html, 'fallback.xhtml');
 
@@ -225,8 +224,7 @@ void main() {
 </body></html>
 ''';
 
-      final result =
-          extractSectionText(html, 'h.9ugsminh1ia2', 'h.another1id');
+      final result = extractSectionText(html, 'h.9ugsminh1ia2', 'h.another1id');
 
       expect(result, contains('Intro text'));
       expect(result, isNot(contains('Chapter 1 text')));
@@ -362,7 +360,7 @@ void main() {
   group('extractSectionStructured null-fragment + special-char endpoint', () {
     test('respects dot-bearing nextFragmentId boundary', () {
       const html = '''
-<html><body>
+<html><head><title>Document Title</title></head><body>
 <p>Leading text.</p>
 <h2 id="h.9ugsminh1ia2">Boundary</h2>
 <p>Should not be included.</p>
@@ -371,7 +369,22 @@ void main() {
       final result = extractSectionStructured(html, null, 'h.9ugsminh1ia2');
       final text = result.extracted.text;
       expect(text, contains('Leading text'));
+      expect(text, isNot(contains('Document Title')));
       expect(text, isNot(contains('Should not be included')));
+      expect(result.sectionEndElement, isNotNull);
+      expect(result.sectionEndElement!.localName, 'h2');
+    });
+
+    test('returns empty body text before first body fragment', () {
+      const html = '''
+<html><head><title>Document Title</title></head><body>
+<h2 id="h.first">First section</h2>
+<p>First body.</p>
+</body></html>
+''';
+      final result = extractSectionStructured(html, null, 'h.first');
+
+      expect(result.extracted.text.trim(), isEmpty);
       expect(result.sectionEndElement, isNotNull);
       expect(result.sectionEndElement!.localName, 'h2');
     });
@@ -475,9 +488,7 @@ void main() {
     });
 
     test('detects aside element', () {
-      final doc = html_parser.parse(
-        '<aside><p id="test">Content</p></aside>',
-      );
+      final doc = html_parser.parse('<aside><p id="test">Content</p></aside>');
       final element = doc.querySelector('#test')!;
 
       expect(isInsideNoteOrSidebar(element), true);

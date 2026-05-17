@@ -44,6 +44,21 @@ void main() {
       expect(result.root.subsections, isEmpty);
     });
 
+    test('flattens EPUB3 document-title nav wrapper', () async {
+      final epubBytes = _createDocumentTitleWrapperEpub();
+      final extractor = EpubExtractor();
+
+      final result = await extractor.extract(epubBytes, filename: 'test.epub');
+
+      expect(result.root.title, 'Test Book');
+      expect(result.root.subsections, hasLength(1));
+      expect(result.root.subsections.first.title, '1. Activity lifecycle');
+      expect(
+        result.root.subsections.first.content.single,
+        isNot(contains('Test Book')),
+      );
+    });
+
     test('uses provided logger instance', () async {
       final logRecords = <String>[];
       final logger = Logger.detached('test-extractor');
@@ -57,10 +72,7 @@ void main() {
       // should have been written to the global root logger from this
       // extraction.
       expect(logRecords, isNotEmpty);
-      expect(
-        logRecords.any((m) => m.startsWith('Converting EPUB:')),
-        isTrue,
-      );
+      expect(logRecords.any((m) => m.startsWith('Converting EPUB:')), isTrue);
     });
 
     test('progress callback reports stages', () async {
@@ -73,7 +85,6 @@ void main() {
 
       expect(stages, containsAll(<String>['Parsing EPUB']));
     });
-
   });
 }
 
@@ -153,6 +164,90 @@ Uint8List _createMinimalEpub() {
       'OEBPS/chapter01.xhtml',
       chapter1.length,
       utf8.encode(chapter1),
+    ),
+  );
+
+  final zipEncoder = ZipEncoder();
+  return Uint8List.fromList(zipEncoder.encode(archive));
+}
+
+Uint8List _createDocumentTitleWrapperEpub() {
+  final archive = Archive();
+
+  archive.addFile(
+    ArchiveFile('mimetype', 20, utf8.encode('application/epub+zip')),
+  );
+
+  const containerXml = '''<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="GoogleDoc/package.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>''';
+  archive.addFile(
+    ArchiveFile(
+      'META-INF/container.xml',
+      containerXml.length,
+      utf8.encode(containerXml),
+    ),
+  );
+
+  const packageOpf = '''<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="uid" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="uid">test-wrapper-epub</dc:identifier>
+    <dc:language>en</dc:language>
+    <dc:title>Test Book</dc:title>
+  </metadata>
+  <manifest>
+    <item href="nav.xhtml" id="toc" media-type="application/xhtml+xml" properties="nav"/>
+    <item href="chapter.xhtml" id="main" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="main"/>
+  </spine>
+</package>''';
+  archive.addFile(
+    ArchiveFile(
+      'GoogleDoc/package.opf',
+      packageOpf.length,
+      utf8.encode(packageOpf),
+    ),
+  );
+
+  const nav = '''<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+  <head><meta charset="utf-8"/></head>
+  <body>
+    <nav epub:type="toc" id="toc">
+      <ol>
+        <li>
+          <a href="chapter.xhtml">Test Book</a>
+          <ol>
+            <li><a href="chapter.xhtml#h.first">1. Activity lifecycle</a></li>
+          </ol>
+        </li>
+      </ol>
+    </nav>
+  </body>
+</html>''';
+  archive.addFile(
+    ArchiveFile('GoogleDoc/nav.xhtml', nav.length, utf8.encode(nav)),
+  );
+
+  const chapter = '''<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>Test Book</title></head>
+  <body>
+    <h2 id="h.first">1. Activity lifecycle</h2>
+    <p>Activity lifecycle body.</p>
+  </body>
+</html>''';
+  archive.addFile(
+    ArchiveFile(
+      'GoogleDoc/chapter.xhtml',
+      chapter.length,
+      utf8.encode(chapter),
     ),
   );
 
