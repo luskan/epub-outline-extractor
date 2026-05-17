@@ -55,8 +55,45 @@ void main() {
       expect(result.root.subsections.first.title, '1. Activity lifecycle');
       expect(
         result.root.subsections.first.content.single,
+        startsWith('Preface before first heading.'),
+      );
+      expect(
+        result.root.subsections.first.content.single,
         isNot(contains('Test Book')),
       );
+      final structured = StructuredContent.tryParse(
+        result.root.subsections.first.structuredContentJson,
+      );
+      expect(structured, isNotNull);
+      expect(
+        structured!.isValidFor(result.root.subsections.first.content.single),
+        isTrue,
+      );
+    });
+
+    test('preserves same-spine sibling NAV branches and full depth', () async {
+      final epubBytes = _createSameSpineAnchorsEpub();
+      final extractor = EpubExtractor();
+
+      final result = await extractor.extract(epubBytes, filename: 'test.epub');
+
+      expect(result.chapters, hasLength(1));
+      expect(result.root.subsections, hasLength(2));
+      expect(result.root.subsections.map((s) => s.title), ['Part A', 'Part B']);
+
+      final partA = result.root.subsections.first;
+      expect(partA.subsections, hasLength(1));
+      expect(partA.subsections.single.title, 'Section A1');
+      expect(partA.subsections.single.subsections, hasLength(1));
+      expect(partA.subsections.single.subsections.single.title, 'Detail A1a');
+      expect(
+        partA.subsections.single.subsections.single.content.single,
+        contains('Detail body.'),
+      );
+
+      final partB = result.root.subsections.last;
+      expect(partB.subsections.single.title, 'Section B1');
+      expect(partB.subsections.single.content.single, contains('B1 body.'));
     });
 
     test('uses provided logger instance', () async {
@@ -171,6 +208,103 @@ Uint8List _createMinimalEpub() {
   return Uint8List.fromList(zipEncoder.encode(archive));
 }
 
+Uint8List _createSameSpineAnchorsEpub() {
+  final archive = Archive();
+
+  archive.addFile(
+    ArchiveFile('mimetype', 20, utf8.encode('application/epub+zip')),
+  );
+
+  const containerXml = '''<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/package.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>''';
+  archive.addFile(
+    ArchiveFile(
+      'META-INF/container.xml',
+      containerXml.length,
+      utf8.encode(containerXml),
+    ),
+  );
+
+  const packageOpf = '''<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="uid" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="uid">same-spine-anchors</dc:identifier>
+    <dc:language>en</dc:language>
+    <dc:title>Same Spine Anchors</dc:title>
+  </metadata>
+  <manifest>
+    <item href="nav.xhtml" id="toc" media-type="application/xhtml+xml" properties="nav"/>
+    <item href="chapter.xhtml" id="main" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="main"/>
+  </spine>
+</package>''';
+  archive.addFile(
+    ArchiveFile(
+      'OEBPS/package.opf',
+      packageOpf.length,
+      utf8.encode(packageOpf),
+    ),
+  );
+
+  const nav = '''<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+  <head><meta charset="utf-8"/></head>
+  <body>
+    <nav epub:type="toc" id="toc">
+      <ol>
+        <li>
+          <a href="chapter.xhtml#h.partA">Part A</a>
+          <ol>
+            <li>
+              <a href="chapter.xhtml#h.secA">Section A1</a>
+              <ol>
+                <li><a href="chapter.xhtml#h.detailA">Detail A1a</a></li>
+              </ol>
+            </li>
+          </ol>
+        </li>
+        <li>
+          <a href="chapter.xhtml#h.partB">Part B</a>
+          <ol>
+            <li><a href="chapter.xhtml#h.secB">Section B1</a></li>
+          </ol>
+        </li>
+      </ol>
+    </nav>
+  </body>
+</html>''';
+  archive.addFile(ArchiveFile('OEBPS/nav.xhtml', nav.length, utf8.encode(nav)));
+
+  const chapter = '''<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>Same Spine Anchors</title></head>
+  <body>
+    <h1 id="h.partA">Part A</h1>
+    <p>Part A intro.</p>
+    <h2 id="h.secA">Section A1</h2>
+    <p>Section A1 body.</p>
+    <h3 id="h.detailA">Detail A1a</h3>
+    <p>Detail body.</p>
+    <h1 id="h.partB">Part B</h1>
+    <p>Part B intro.</p>
+    <h2 id="h.secB">Section B1</h2>
+    <p>B1 body.</p>
+  </body>
+</html>''';
+  archive.addFile(
+    ArchiveFile('OEBPS/chapter.xhtml', chapter.length, utf8.encode(chapter)),
+  );
+
+  final zipEncoder = ZipEncoder();
+  return Uint8List.fromList(zipEncoder.encode(archive));
+}
+
 Uint8List _createDocumentTitleWrapperEpub() {
   final archive = Archive();
 
@@ -239,6 +373,7 @@ Uint8List _createDocumentTitleWrapperEpub() {
 <html xmlns="http://www.w3.org/1999/xhtml">
   <head><title>Test Book</title></head>
   <body>
+    <p>Preface before first heading.</p>
     <h2 id="h.first">1. Activity lifecycle</h2>
     <p>Activity lifecycle body.</p>
   </body>

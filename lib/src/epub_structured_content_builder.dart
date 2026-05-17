@@ -179,12 +179,40 @@ class EpubStructuredContentBuilder {
 
   static bool _isBlockLikeForBound(String tag) {
     const blockTags = {
-      'p', 'div', 'section', 'article', 'aside', 'header', 'footer',
-      'nav', 'main', 'figure', 'figcaption', 'blockquote', 'pre',
-      'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-      'ul', 'ol', 'li', 'dl', 'dt', 'dd',
-      'table', 'tr', 'th', 'td', 'thead', 'tbody', 'tfoot',
-      'details', 'summary',
+      'p',
+      'div',
+      'section',
+      'article',
+      'aside',
+      'header',
+      'footer',
+      'nav',
+      'main',
+      'figure',
+      'figcaption',
+      'blockquote',
+      'pre',
+      'h1',
+      'h2',
+      'h3',
+      'h4',
+      'h5',
+      'h6',
+      'ul',
+      'ol',
+      'li',
+      'dl',
+      'dt',
+      'dd',
+      'table',
+      'tr',
+      'th',
+      'td',
+      'thead',
+      'tbody',
+      'tfoot',
+      'details',
+      'summary',
     };
     return blockTags.contains(tag);
   }
@@ -266,17 +294,16 @@ class EpubStructuredContentBuilder {
   ///
   /// Emits a `paragraph` block with an italic emphasis mark covering the
   /// whole range.
-  static bool _emitFigcaptionIfApplicable(
-    dom.Element node,
-    _WalkContext ctx,
-  ) {
+  static bool _emitFigcaptionIfApplicable(dom.Element node, _WalkContext ctx) {
     if (ctx.elementRanges == null) return false;
     if (node.localName?.toLowerCase() != 'figcaption') return false;
     if (!_isInsideCodeFigure(node)) return false;
     final ranges = ctx.elementRanges![node];
     if (ranges == null || ranges.isEmpty) return false;
     final r = ranges.single;
-    if (r.start < ctx.searchFrom) return true; // claim, but skip — shouldn't happen
+    if (r.start < ctx.searchFrom) {
+      return true; // claim, but skip — shouldn't happen
+    }
     ctx.recordBlock(
       ContentBlock(
         type: ContentBlockType.paragraph,
@@ -503,8 +530,8 @@ class EpubStructuredContentBuilder {
             if (trimmedEnd > trimmedStart) {
               final marker = state.isFirstSlice
                   ? (isOrdered
-                      ? _markerForOrderedList(parentList, counter)
-                      : '•')
+                        ? _markerForOrderedList(parentList, counter)
+                        : '•')
                   : '';
               // Slice-bounded fuzzy match for inline marks within this <li>.
               // Walks the whole <li> subtree but bounds matches to the
@@ -786,10 +813,7 @@ class EpubStructuredContentBuilder {
   ///   captured first; if no body slice is non-straddling (e.g. a single
   ///   slice covers text-pre-text in one cell), no table block emits at
   ///   all. Cell text remains in plainText regardless.
-  static bool _emitTableBlockIfApplicable(
-    dom.Element node,
-    _WalkContext ctx,
-  ) {
+  static bool _emitTableBlockIfApplicable(dom.Element node, _WalkContext ctx) {
     if (ctx.elementRanges == null) return false;
     if (node.localName?.toLowerCase() != 'table') return false;
 
@@ -834,7 +858,8 @@ class EpubStructuredContentBuilder {
     // collecting <tr> children's <th>/<td> cells.
     final rows = _collectTableRows(node);
     final tableRanges = ctx.elementRanges![node];
-    final tableRange = (rows.isNotEmpty &&
+    final tableRange =
+        (rows.isNotEmpty &&
             tableRanges != null &&
             tableRanges.isNotEmpty &&
             tableRanges.first.end > tableRanges.first.start)
@@ -989,11 +1014,7 @@ class EpubStructuredContentBuilder {
   /// doesn't want them (its container provides item spacing already).
   /// If the entire range is whitespace, returns `(end, end)` (caller
   /// should check for empty trimmed range).
-  static (int, int) _trimRangeWhitespace(
-    String plainText,
-    int start,
-    int end,
-  ) {
+  static (int, int) _trimRangeWhitespace(String plainText, int start, int end) {
     var s = start;
     var e = end;
     while (s < e) {
@@ -1166,8 +1187,9 @@ class EpubStructuredContentBuilder {
           emitDtDd(activeDtRange, null);
         } else {
           final ranges = ctx.elementRanges![child];
-          final ddRange =
-              (ranges == null || ranges.isEmpty) ? null : ranges.first;
+          final ddRange = (ranges == null || ranges.isEmpty)
+              ? null
+              : ranges.first;
           emitDtDd(activeDtRange, ddRange);
         }
         // Block descendants of the <dd> dispatch AFTER the definitionItem,
@@ -1252,36 +1274,62 @@ class EpubStructuredContentBuilder {
     final normalized = _normalizeForMatch(elementText);
     if (normalized.isEmpty) return null;
 
-    final searchKey =
-        normalized.length > 60 ? normalized.substring(0, 60) : normalized;
+    final searchKey = normalized.length > 60
+        ? normalized.substring(0, 60)
+        : normalized;
     var idx = _fuzzyIndexOf(plainText, searchKey, searchFrom);
     if (idx < 0) return null;
 
-    final endNormalized =
-        normalized.length > 60 ? normalized.substring(normalized.length - 30) : null;
-    int endIdx;
-    if (endNormalized != null) {
-      final endSearch = _fuzzyIndexOf(plainText, endNormalized, idx + 10);
-      endIdx = endSearch >= 0 ? endSearch + endNormalized.length : idx + elementText.length;
-    } else {
-      endIdx = idx + _findMatchLength(plainText, idx, normalized);
+    final (matchLength, completeMatch) = _findMatchLengthWithCompleteness(
+      plainText,
+      idx,
+      normalized,
+    );
+    if (matchLength <= 0) return null;
+
+    var endIdx = idx + matchLength;
+    if (!completeMatch && normalized.length > 60) {
+      final endNormalized = normalized.substring(normalized.length - 30);
+      final suffixSearchFrom = (endIdx - endNormalized.length * 3).clamp(
+        idx + 1,
+        plainText.length,
+      );
+      final endSearch = _fuzzyIndexOf(
+        plainText,
+        endNormalized,
+        suffixSearchFrom,
+      );
+      if (endSearch >= 0) {
+        final (suffixLength, _) = _findMatchLengthWithCompleteness(
+          plainText,
+          endSearch,
+          endNormalized,
+        );
+        if (suffixLength > 0) endIdx = endSearch + suffixLength;
+      }
     }
 
     endIdx = endIdx.clamp(idx + 1, plainText.length);
+    final (trimmedStart, trimmedEnd) = _trimRangeWhitespace(
+      plainText,
+      idx,
+      endIdx,
+    );
+    if (trimmedEnd <= trimmedStart) return null;
 
     final marks = <InlineMark>[];
     _collectInlineMarks(
       element,
       plainText,
-      _MarkCursor(idx, endIdx),
+      _MarkCursor(trimmedStart, trimmedEnd),
       marks,
       insideCodeBlock: insideCodeBlock,
     );
 
     return ContentBlock(
       type: type,
-      start: idx,
-      end: endIdx,
+      start: trimmedStart,
+      end: trimmedEnd,
       level: level,
       marks: marks,
     );
@@ -1445,9 +1493,7 @@ class EpubStructuredContentBuilder {
 
   /// Normalize text for matching: collapse whitespace.
   static String _normalizeForMatch(String text) {
-    return text
-        .replaceAll(RegExp(r'\s+'), ' ')
-        .trim();
+    return text.replaceAll(RegExp(r'\s+'), ' ').trim();
   }
 
   /// Find text in plainText with whitespace-flexible matching.
@@ -1458,7 +1504,10 @@ class EpubStructuredContentBuilder {
     if (exactIdx >= 0) return exactIdx;
 
     final normalizedPlain = _normalizeForMatch(
-      plainText.substring(from, (from + needle.length * 3).clamp(0, plainText.length)),
+      plainText.substring(
+        from,
+        (from + needle.length * 3).clamp(0, plainText.length),
+      ),
     );
     final idx = normalizedPlain.indexOf(needle);
     if (idx >= 0) {
@@ -1474,13 +1523,18 @@ class EpubStructuredContentBuilder {
   }
 
   /// Map an offset in normalized text back to the original text.
-  static int _mapNormalizedOffset(String original, int baseOffset, int normalizedOffset) {
+  static int _mapNormalizedOffset(
+    String original,
+    int baseOffset,
+    int normalizedOffset,
+  ) {
     var origIdx = baseOffset;
     var normIdx = 0;
     while (origIdx < original.length && normIdx < normalizedOffset) {
       if (RegExp(r'\s').hasMatch(original[origIdx])) {
         origIdx++;
-        while (origIdx < original.length && RegExp(r'\s').hasMatch(original[origIdx])) {
+        while (origIdx < original.length &&
+            RegExp(r'\s').hasMatch(original[origIdx])) {
           origIdx++;
         }
         normIdx++;
@@ -1493,7 +1547,23 @@ class EpubStructuredContentBuilder {
   }
 
   /// Find how many characters in plainText match the normalized text.
-  static int _findMatchLength(String plainText, int startIdx, String normalized) {
+  static int _findMatchLength(
+    String plainText,
+    int startIdx,
+    String normalized,
+  ) {
+    return _findMatchLengthWithCompleteness(plainText, startIdx, normalized).$1;
+  }
+
+  /// Find how many source characters match [normalized] and whether the
+  /// normalized text was consumed fully. The length is measured in
+  /// [plainText] characters from [startIdx], including any leading whitespace
+  /// skipped before the first semantic character.
+  static (int, bool) _findMatchLengthWithCompleteness(
+    String plainText,
+    int startIdx,
+    String normalized,
+  ) {
     var origIdx = startIdx;
     var normIdx = 0;
     while (origIdx < plainText.length && normIdx < normalized.length) {
@@ -1508,7 +1578,7 @@ class EpubStructuredContentBuilder {
         break;
       }
     }
-    return origIdx - startIdx;
+    return (origIdx - startIdx, normIdx >= normalized.length);
   }
 
   static bool _isParagraphLike(String tag) {
@@ -1518,9 +1588,27 @@ class EpubStructuredContentBuilder {
 
   static bool _isBlockContainer(String tag) {
     const tags = {
-      'div', 'section', 'article', 'main', 'aside', 'header', 'footer',
-      'nav', 'figure', 'details', 'summary', 'form', 'fieldset',
-      'ul', 'ol', 'dl', 'table', 'tbody', 'thead', 'tfoot', 'tr',
+      'div',
+      'section',
+      'article',
+      'main',
+      'aside',
+      'header',
+      'footer',
+      'nav',
+      'figure',
+      'details',
+      'summary',
+      'form',
+      'fieldset',
+      'ul',
+      'ol',
+      'dl',
+      'table',
+      'tbody',
+      'thead',
+      'tfoot',
+      'tr',
     };
     return tags.contains(tag);
   }
@@ -1594,13 +1682,10 @@ class _LiWalkState {
   bool isFirstSlice;
   bool inDirectTextRun;
 
-  _LiWalkState({
-    required this.li,
-    required this.depth,
-    required this.ranges,
-  })  : sliceIndex = 0,
-        isFirstSlice = true,
-        inDirectTextRun = false;
+  _LiWalkState({required this.li, required this.depth, required this.ranges})
+    : sliceIndex = 0,
+      isFirstSlice = true,
+      inDirectTextRun = false;
 }
 
 /// Mutable cursor threaded through [EpubStructuredContentBuilder._collectInlineMarks]

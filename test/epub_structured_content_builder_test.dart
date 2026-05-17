@@ -95,8 +95,10 @@ void main() {
   group('EpubStructuredContentBuilder.buildFromHtml parity', () {
     for (final f in _fixtures) {
       test(f.name, () {
-        final actual =
-            EpubStructuredContentBuilder.buildFromHtml(f.html, f.plainText);
+        final actual = EpubStructuredContentBuilder.buildFromHtml(
+          f.html,
+          f.plainText,
+        );
         expect(actual, f.expectedJson);
       });
     }
@@ -118,6 +120,37 @@ void main() {
         EpubStructuredContentBuilder.buildFromHtml(html, plainText),
         isNull,
       );
+    });
+
+    test('fuzzy paragraph ranges trim separators and stop at paragraph end', () {
+      const html =
+          '<html><body>'
+          '<p><span>onCreate()</span>'
+          '<span> jest wywoływane przy tworzeniu aktywności. To jest dobre '
+          'miejsce na ustawienie layoutu, inicjalizację bindingu, pobranie '
+          'referencji do </span><span>ViewModel</span><span>, ustawienie '
+          'adapterów, listenerów oraz odtworzenie podstawowego stanu z '
+          '</span><span>savedInstanceState</span><span>.</span></p>'
+          '<p>Przykład:</p>'
+          '</body></html>';
+      const plainText =
+          '\n\nonCreate()\n'
+          'jest wywoływane przy tworzeniu aktywności. To jest dobre miejsce '
+          'na ustawienie layoutu, inicjalizację bindingu, pobranie referencji '
+          'do\nViewModel\n, ustawienie adapterów, listenerów oraz odtworzenie '
+          'podstawowego stanu z savedInstanceState\n.'
+          '\n\nPrzykład:\n\nclass MainActivity : AppCompatActivity() {';
+
+      final json = EpubStructuredContentBuilder.buildFromHtml(html, plainText);
+      expect(json, isNotNull);
+      final parsed = StructuredContent.tryParse(json);
+      expect(parsed, isNotNull);
+
+      final block = parsed!.annotations.first;
+      final blockText = plainText.substring(block.start, block.end);
+      expect(blockText, startsWith('onCreate()'));
+      expect(blockText, endsWith('.'));
+      expect(blockText, isNot(contains('Przykład')));
     });
   });
 
@@ -142,7 +175,8 @@ void main() {
     test('<pre> emits a code block with preserveLineBreaks + monospace', () {
       // Plain text needs to be ≥50 chars after extract+clean for the
       // length guard.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Some prose here that pads us above the fifty char minimum.</p>'
           '<pre>void foo() {\n  return 0;\n}</pre>'
           '</body></html>';
@@ -160,7 +194,8 @@ void main() {
     });
 
     test('tabs in <pre> become 4 spaces in plain text', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding to exceed the fifty char minimum threshold here.</p>'
           '<pre>\tone\n\t\ttwo</pre>'
           '</body></html>';
@@ -171,7 +206,8 @@ void main() {
 
     test('<figure class="code"><figcaption>Listing</figcaption><pre>...</pre>'
         '</figure> emits caption then code, in DOM order', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters total here.</p>'
           '<figure class="code">'
           '<figcaption>Listing 1: foo</figcaption>'
@@ -181,8 +217,8 @@ void main() {
       final blocks = buildFromFullPipeline(html);
       final caption = blocks.firstWhere(
         (b) => b.marks.any(
-              (m) => m.type == InlineMarkType.emphasis && m.style == 'italic',
-            ),
+          (m) => m.type == InlineMarkType.emphasis && m.style == 'italic',
+        ),
         orElse: () => throw StateError('no italic-marked block'),
       );
       final code = blocks.firstWhere(
@@ -194,7 +230,8 @@ void main() {
     });
 
     test('inline <code> in prose emits monospace mark', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Use <code>foo()</code> very often to ensure padding above the '
           'fifty char minimum threshold for sure.</p>'
           '</body></html>';
@@ -209,7 +246,8 @@ void main() {
     });
 
     test('inline <code> inside <pre> does NOT double-emit monospace', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding exists here for sure to exceed fifty char minimum.</p>'
           '<pre><code>void</code> <code class="k">foo</code>();</pre>'
           '</body></html>';
@@ -226,7 +264,8 @@ void main() {
     });
 
     test('<kbd> / <samp> / <var> / <tt> all emit monospace marks', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Press <kbd>Ctrl</kbd>, see <samp>OK</samp>, '
           'use <var>x</var> and <tt>y</tt>; padding is here too.</p>'
           '</body></html>';
@@ -241,60 +280,68 @@ void main() {
     });
 
     test('two adjacent <pre> blocks emit two distinct code blocks', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding-here-for-fifty-characters-yes-still-here-thanks.</p>'
           '<pre>first one</pre>'
           '<pre>second one</pre>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final codeBlocks =
-          blocks.where((b) => b.preserveLineBreaks).toList(growable: false);
+      final codeBlocks = blocks
+          .where((b) => b.preserveLineBreaks)
+          .toList(growable: false);
       expect(codeBlocks, hasLength(2));
       expect(codeBlocks[0].end, lessThanOrEqualTo(codeBlocks[1].start));
     });
 
     test('two adjacent <pre> blocks with IDENTICAL content still distinct', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding-here-for-fifty-characters-yes-still-here-thanks.</p>'
           '<pre>same content</pre>'
           '<pre>same content</pre>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final codeBlocks =
-          blocks.where((b) => b.preserveLineBreaks).toList(growable: false);
+      final codeBlocks = blocks
+          .where((b) => b.preserveLineBreaks)
+          .toList(growable: false);
       expect(codeBlocks, hasLength(2));
       // Element-identity disambiguation: each <pre> has its own range.
       expect(codeBlocks[0].start, isNot(codeBlocks[1].start));
     });
 
-    test('plain <figcaption> outside code figure stays as paragraph (no italic mark)',
-        () {
-      const html = '<html><body>'
-          '<p>Padding-here-for-fifty-characters-yes-still-here-thanks.</p>'
-          '<figure>'
-          '<figcaption>Image caption text here</figcaption>'
-          '</figure>'
-          '</body></html>';
-      final blocks = buildFromFullPipeline(html);
-      // The figcaption falls through to _isParagraphLike → emits as plain
-      // paragraph (no italic mark from the v1.0 figcaption-in-code path).
-      final figcaptionBlock = blocks.firstWhere(
-        (b) =>
-            b.type == ContentBlockType.paragraph &&
-            !b.preserveLineBreaks &&
-            b.start > blocks.first.end,
-        orElse: () => throw StateError('no figcaption-derived block'),
-      );
-      expect(
-        figcaptionBlock.marks.any(
-          (m) => m.type == InlineMarkType.emphasis && m.style == 'italic',
-        ),
-        isFalse,
-      );
-    });
+    test(
+      'plain <figcaption> outside code figure stays as paragraph (no italic mark)',
+      () {
+        const html =
+            '<html><body>'
+            '<p>Padding-here-for-fifty-characters-yes-still-here-thanks.</p>'
+            '<figure>'
+            '<figcaption>Image caption text here</figcaption>'
+            '</figure>'
+            '</body></html>';
+        final blocks = buildFromFullPipeline(html);
+        // The figcaption falls through to _isParagraphLike → emits as plain
+        // paragraph (no italic mark from the v1.0 figcaption-in-code path).
+        final figcaptionBlock = blocks.firstWhere(
+          (b) =>
+              b.type == ContentBlockType.paragraph &&
+              !b.preserveLineBreaks &&
+              b.start > blocks.first.end,
+          orElse: () => throw StateError('no figcaption-derived block'),
+        );
+        expect(
+          figcaptionBlock.marks.any(
+            (m) => m.type == InlineMarkType.emphasis && m.style == 'italic',
+          ),
+          isFalse,
+        );
+      },
+    );
 
     test('hash validates over plain text', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Some prose here that pads us above the fifty char minimum.</p>'
           '<pre>code\n  body</pre>'
           '</body></html>';
@@ -335,14 +382,16 @@ void main() {
     }
 
     test('<ul> emits listItem blocks with bullet markers', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ul><li>Apples are red.</li><li>Bananas are yellow.</li>'
           '<li>Cherries are dark.</li></ul>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final items =
-          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      final items = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
       expect(items, hasLength(3));
       for (final i in items) {
         expect(i.listMarker, '•');
@@ -350,14 +399,16 @@ void main() {
     });
 
     test('<ol> emits listItem blocks with numeric markers 1./2./3.', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ol><li>First step here.</li><li>Second step here.</li>'
           '<li>Third step here.</li></ol>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final items =
-          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      final items = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
       expect(items, hasLength(3));
       expect(items[0].listMarker, '1.');
       expect(items[1].listMarker, '2.');
@@ -365,29 +416,34 @@ void main() {
     });
 
     test('<ol type="a"> emits a./b./c. markers', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ol type="a"><li>Alpha.</li><li>Beta.</li><li>Gamma.</li></ol>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final items =
-          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      final items = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
       expect(items.map((b) => b.listMarker), ['a.', 'b.', 'c.']);
     });
 
     test('<ol type="A"> emits A./B. markers', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ol type="A"><li>Alpha.</li><li>Beta.</li></ol>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final items =
-          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      final items = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
       expect(items.map((b) => b.listMarker), ['A.', 'B.']);
     });
 
     test('list item ranges land on the right substring of plain text', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ul><li>Apples</li><li>Bananas</li></ul>'
           '</body></html>';
@@ -405,34 +461,34 @@ void main() {
           .toList();
       expect(items, hasLength(2));
       expect(cleaned.text.substring(items[0].start, items[0].end), 'Apples');
-      expect(
-        cleaned.text.substring(items[1].start, items[1].end),
-        'Bananas',
-      );
+      expect(cleaned.text.substring(items[1].start, items[1].end), 'Bananas');
     });
 
     test('nested list flat emit (outer + inner, DOM order)', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ul><li>outer<ul><li>inner</li></ul></li></ul>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final items =
-          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      final items = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
       expect(items, hasLength(2));
       // DOM order: outer before inner; ranges non-overlapping.
       expect(items[0].end, lessThanOrEqualTo(items[1].start));
     });
 
-    test('<li>outer<ul><li>inner</li></ul>tail</li>: 3 items, DOM order',
-        () {
-      const html = '<html><body>'
+    test('<li>outer<ul><li>inner</li></ul>tail</li>: 3 items, DOM order', () {
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ul><li>outer<ul><li>inner</li></ul>tail</li></ul>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final items =
-          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      final items = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
       expect(items, hasLength(3));
       // DOM order: outer → inner → tail.
       expect(items[0].end, lessThanOrEqualTo(items[1].start));
@@ -443,57 +499,62 @@ void main() {
       expect(items[2].listMarker, '');
     });
 
-    test(
-        '<li><ul><li>inner</li></ul>tail</li>: no prefix → 2 items, '
+    test('<li><ul><li>inner</li></ul>tail</li>: no prefix → 2 items, '
         'tail keeps bullet', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ul><li><ul><li>inner</li></ul>tail</li></ul>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final items =
-          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      final items = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
       expect(items, hasLength(2));
       // Inner first, then tail — tail is the outer-li's first slice so it
       // keeps the bullet marker (plan §5.8 trace).
       expect(items[1].listMarker, '•');
     });
 
-    test('<dl><dt>Term</dt><dd>def</dd></dl> emits one definitionItem block',
-        () {
-      const html = '<html><body>'
-          '<p>Padding so the chapter exceeds fifty characters here.</p>'
-          '<dl><dt>Term word</dt><dd>The definition for that term.</dd></dl>'
-          '</body></html>';
-      final raw = extractStructured(html);
-      final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
-      final extraction = SectionExtraction(
-        extracted: cleaned,
-        sectionStartElement: null,
-        sectionEndElement: null,
-      );
-      final json = EpubStructuredContentBuilder.build(extraction);
-      final parsed = StructuredContent.tryParse(json);
-      final defs = parsed!.annotations
-          .where((b) => b.type == ContentBlockType.definitionItem)
-          .toList();
-      expect(defs, hasLength(1));
-      final def = defs.single;
-      expect(def.definitionTermEnd, isNotNull);
-      // Term substring matches "Term word".
-      expect(
-        cleaned.text.substring(def.start, def.definitionTermEnd!),
-        'Term word',
-      );
-      // Full block covers term + definition.
-      expect(
-        cleaned.text.substring(def.start, def.end),
-        contains('The definition for that term.'),
-      );
-    });
+    test(
+      '<dl><dt>Term</dt><dd>def</dd></dl> emits one definitionItem block',
+      () {
+        const html =
+            '<html><body>'
+            '<p>Padding so the chapter exceeds fifty characters here.</p>'
+            '<dl><dt>Term word</dt><dd>The definition for that term.</dd></dl>'
+            '</body></html>';
+        final raw = extractStructured(html);
+        final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
+        final extraction = SectionExtraction(
+          extracted: cleaned,
+          sectionStartElement: null,
+          sectionEndElement: null,
+        );
+        final json = EpubStructuredContentBuilder.build(extraction);
+        final parsed = StructuredContent.tryParse(json);
+        final defs = parsed!.annotations
+            .where((b) => b.type == ContentBlockType.definitionItem)
+            .toList();
+        expect(defs, hasLength(1));
+        final def = defs.single;
+        expect(def.definitionTermEnd, isNotNull);
+        // Term substring matches "Term word".
+        expect(
+          cleaned.text.substring(def.start, def.definitionTermEnd!),
+          'Term word',
+        );
+        // Full block covers term + definition.
+        expect(
+          cleaned.text.substring(def.start, def.end),
+          contains('The definition for that term.'),
+        );
+      },
+    );
 
     test('hash validates for v1.1 list+dl JSON', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ul><li>One</li><li>Two</li></ul>'
           '<dl><dt>Term</dt><dd>def</dd></dl>'
@@ -513,23 +574,25 @@ void main() {
 
     test('<li> with <pre> inside: pre still emits as code block, not '
         'subsumed by listItem', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ul><li>Prelude text<pre>code body</pre></li></ul>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
       // One listItem (for "Prelude text") + one code block (for <pre>).
-      final items =
-          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      final items = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
       final codes = blocks.where((b) => b.preserveLineBreaks).toList();
       expect(items, hasLength(1));
       expect(codes, hasLength(1));
       expect(items.single.end, lessThanOrEqualTo(codes.single.start));
     });
 
-    test('JSON round-trips listItem + definitionItem through model parser',
-        () {
-      const html = '<html><body>'
+    test('JSON round-trips listItem + definitionItem through model parser', () {
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ul><li>One item</li></ul>'
           '<dl><dt>Word</dt><dd>def</dd></dl>'
@@ -553,14 +616,16 @@ void main() {
         isTrue,
       );
       expect(
-        parsed.annotations
-            .any((b) => b.type == ContentBlockType.definitionItem),
+        parsed.annotations.any(
+          (b) => b.type == ContentBlockType.definitionItem,
+        ),
         isTrue,
       );
     });
 
     test('plain text contains list item content (sanity check)', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ul><li>Apples</li><li>Bananas</li></ul>'
           '</body></html>';
@@ -573,13 +638,15 @@ void main() {
         'order: outer→inner→tail', () {
       // Codex round-1 HIGH: leading "\n" text node before <ul> would
       // previously pop the tail slice early, producing tail→inner.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ul><li>outer\n  <ul><li>inner</li></ul>\n  tail</li></ul>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final items =
-          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      final items = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
       expect(items, hasLength(3));
       // DOM order: outer < inner < tail.
       expect(items[0].end, lessThanOrEqualTo(items[1].start));
@@ -590,36 +657,35 @@ void main() {
     });
 
     test('pretty-printed no-prefix nested li still emits inner→tail', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ul><li>\n  <ul><li>inner</li></ul>\n  tail</li></ul>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final items =
-          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      final items = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
       expect(items, hasLength(2));
       expect(items[0].end, lessThanOrEqualTo(items[1].start));
       // Tail is the outer-li's first slice → bullet marker.
       expect(items[1].listMarker, '•');
     });
 
-    test(
-        '<dd>before<pre>code</pre>after</dd>: dt/dd shadows on <pre>; no '
+    test('<dd>before<pre>code</pre>after</dd>: dt/dd shadows on <pre>; no '
         'preserved-boundary straddle', () {
       // Codex round-1 MEDIUM: without block shadowing in findDtDdAncestor,
       // dd's recorded range would straddle the pre's preserved range and
       // ExtractedText constructor would throw.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<dl><dt>Term</dt><dd>before<pre>code body</pre>after</dd></dl>'
           '</body></html>';
       // Should not throw.
       final blocks = buildFromFullPipeline(html);
       // Pre still emits as a code block.
-      expect(
-        blocks.where((b) => b.preserveLineBreaks).toList(),
-        hasLength(1),
-      );
+      expect(blocks.where((b) => b.preserveLineBreaks).toList(), hasLength(1));
     });
 
     test('<li><a>foo<div><pre>code</pre></div>bar</a></li>: inline-wrapped '
@@ -627,13 +693,15 @@ void main() {
       // Codex round-2 MEDIUM: a flat li.nodes iteration would treat <a>
       // as one inline child and pop one slice, missing the second slice
       // and the nested code block.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ul><li><a>foo<div><pre>code body</pre></div>bar</a></li></ul>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final items =
-          blocks.where((b) => b.type == ContentBlockType.listItem).toList();
+      final items = blocks
+          .where((b) => b.type == ContentBlockType.listItem)
+          .toList();
       final codes = blocks.where((b) => b.preserveLineBreaks).toList();
       // Two listItem slices (foo, bar) + one code block.
       expect(items, hasLength(2));
@@ -649,7 +717,8 @@ void main() {
       // a definitionItem covering [dt.start, after.end) would span the
       // pre, suppressing it via the searchFrom overlap guard. Term-only
       // mode (when block descendants present) preserves the code block.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<dl><dt>Term</dt>'
           '<dd><pre>code body</pre>after</dd></dl>'
@@ -669,7 +738,8 @@ void main() {
         'emits term-only definitionItem and code block, dd is orphan', () {
       // Codex round-3 MEDIUM: previously, the dd would emit definitionItem
       // [dt.start, dd.end) which spans the pre, suppressing the code block.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<dl><dt>Term<pre>code body</pre></dt>'
           '<dd>some definition text</dd></dl>'
@@ -693,7 +763,8 @@ void main() {
       // Walking dt children in DOM order dispatches the pre first (code
       // block), then emits the term-only definitionItem at the term's
       // position — searchFrom monotonicity preserved.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<dl><dt><pre>code body</pre>Term</dt>'
           '<dd>some definition text</dd></dl>'
@@ -714,7 +785,8 @@ void main() {
       // Codex round-5 MEDIUM: <pre> wrapped in <div><a> inside dt would
       // be lost because _walkBlocks recursed into <div> but _dispatchNode
       // didn't recurse into inline <a>.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<dl><dt><div><a><pre>code body</pre></a></div>Term</dt>'
           '<dd>def text</dd></dl>'
@@ -732,7 +804,8 @@ void main() {
 
     test('<dl><dd>orphan</dd>: orphan dd dispatches block descendants but '
         'emits no definitionItem', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<dl><dd>orphan with <pre>code body</pre> inside</dd></dl>'
           '</body></html>';
@@ -750,7 +823,8 @@ void main() {
       // _dispatchNode inline-fallthrough at chapter root. Without the
       // fallthrough, <span><p>...</p></span> at body level would never
       // dispatch the <p>.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<span><div><p>nested para inside span</p></div></span>'
           '</body></html>';
@@ -763,14 +837,16 @@ void main() {
     });
 
     test('basic table emits one table block with tableRows', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<table><thead><tr><th>H1</th></tr></thead>'
           '<tbody><tr><td>D1</td></tr></tbody></table>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final tables =
-          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      final tables = blocks
+          .where((b) => b.type == ContentBlockType.table)
+          .toList();
       expect(tables, hasLength(1));
       expect(tables.single.tableRows, [
         ['H1'],
@@ -778,35 +854,40 @@ void main() {
       ]);
     });
 
-    test('table with caption emits italic caption block BEFORE table block',
-        () {
-      const html = '<html><body>'
-          '<p>Padding so the chapter exceeds fifty characters here.</p>'
-          '<table><caption>Cap text</caption>'
-          '<tbody><tr><td>cell</td></tr></tbody></table>'
-          '</body></html>';
-      final blocks = buildFromFullPipeline(html);
-      final captions = blocks
-          .where(
-            (b) =>
-                b.type == ContentBlockType.paragraph &&
-                b.marks.any(
-                  (m) =>
-                      m.type == InlineMarkType.emphasis &&
-                      m.style == 'italic',
-                ),
-          )
-          .toList();
-      final tables =
-          blocks.where((b) => b.type == ContentBlockType.table).toList();
-      expect(captions, hasLength(1));
-      expect(tables, hasLength(1));
-      // Caption before table in DOM order; ranges disjoint.
-      expect(captions.single.end, lessThanOrEqualTo(tables.single.start));
-    });
+    test(
+      'table with caption emits italic caption block BEFORE table block',
+      () {
+        const html =
+            '<html><body>'
+            '<p>Padding so the chapter exceeds fifty characters here.</p>'
+            '<table><caption>Cap text</caption>'
+            '<tbody><tr><td>cell</td></tr></tbody></table>'
+            '</body></html>';
+        final blocks = buildFromFullPipeline(html);
+        final captions = blocks
+            .where(
+              (b) =>
+                  b.type == ContentBlockType.paragraph &&
+                  b.marks.any(
+                    (m) =>
+                        m.type == InlineMarkType.emphasis &&
+                        m.style == 'italic',
+                  ),
+            )
+            .toList();
+        final tables = blocks
+            .where((b) => b.type == ContentBlockType.table)
+            .toList();
+        expect(captions, hasLength(1));
+        expect(tables, hasLength(1));
+        // Caption before table in DOM order; ranges disjoint.
+        expect(captions.single.end, lessThanOrEqualTo(tables.single.start));
+      },
+    );
 
     test('table caption text and body text appear at disjoint ranges', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<table><caption>cap</caption>'
           '<tbody><tr><td>x</td></tr></tbody></table>'
@@ -837,14 +918,16 @@ void main() {
     test('bare <tr> children (no <tbody>) still extract rows', () {
       // package:html parser typically inserts an implicit <tbody>, but we
       // walk both wrapped and bare tr's defensively (plan §5.10).
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<table><tr><th>A</th><th>B</th></tr>'
           '<tr><td>1</td><td>2</td></tr></table>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final tables =
-          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      final tables = blocks
+          .where((b) => b.type == ContentBlockType.table)
+          .toList();
       expect(tables, hasLength(1));
       expect(tables.single.tableRows, [
         ['A', 'B'],
@@ -853,14 +936,16 @@ void main() {
     });
 
     test('empty first cell in table preserves row structure', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<table><tr><th></th><th>A</th></tr>'
           '<tr><td></td><td>1</td></tr></table>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final tables =
-          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      final tables = blocks
+          .where((b) => b.type == ContentBlockType.table)
+          .toList();
       expect(tables, hasLength(1));
       expect(tables.single.tableRows, [
         ['', 'A'],
@@ -872,15 +957,17 @@ void main() {
         'row', () {
       // cpp20 iterator-categories pattern: same cell content in multiple
       // rows. Element-identity anchoring avoids offset confusion.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<table><tr><td>same</td></tr>'
           '<tr><td>same</td></tr>'
           '<tr><td>same</td></tr></table>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final tables =
-          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      final tables = blocks
+          .where((b) => b.type == ContentBlockType.table)
+          .toList();
       expect(tables, hasLength(1));
       expect(tables.single.tableRows, [
         ['same'],
@@ -889,15 +976,16 @@ void main() {
       ]);
     });
 
-    test('malformed table with no rows emits no table block (claim+skip)',
-        () {
-      const html = '<html><body>'
+    test('malformed table with no rows emits no table block (claim+skip)', () {
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<table></table>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final tables =
-          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      final tables = blocks
+          .where((b) => b.type == ContentBlockType.table)
+          .toList();
       expect(tables, isEmpty);
     });
 
@@ -905,7 +993,8 @@ void main() {
       // Pretty-printed input: whitespace text node between </caption> and
       // <tbody>. The caption's range and the table's body range must not
       // straddle that whitespace.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<table>'
           '<caption>cap</caption>\n  '
@@ -919,33 +1008,34 @@ void main() {
                 b.type == ContentBlockType.paragraph &&
                 b.marks.any(
                   (m) =>
-                      m.type == InlineMarkType.emphasis &&
-                      m.style == 'italic',
+                      m.type == InlineMarkType.emphasis && m.style == 'italic',
                 ),
           )
           .toList();
-      final tables =
-          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      final tables = blocks
+          .where((b) => b.type == ContentBlockType.table)
+          .toList();
       expect(captions, hasLength(1));
       expect(tables, hasLength(1));
       expect(captions.single.end, lessThanOrEqualTo(tables.single.start));
     });
 
-    test('nested tables flatten — inner table emits no separate block',
-        () {
+    test('nested tables flatten — inner table emits no separate block', () {
       // Codex round-1 v1.2 MEDIUM: previously, inner table emitted as a
       // separate block AND outer's cell.text included inner content,
       // causing visual duplication. With flattening, only the outer
       // table emits; inner content is part of the outer cell.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<table><tbody><tr><td>'
           '<table><tbody><tr><td>inner</td></tr></tbody></table>'
           '</td></tr></tbody></table>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final tables =
-          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      final tables = blocks
+          .where((b) => b.type == ContentBlockType.table)
+          .toList();
       expect(tables, hasLength(1));
       // Outer table's single cell contains "inner" via cell.text.
       expect(tables.single.tableRows, [
@@ -959,7 +1049,8 @@ void main() {
       // outer's table range, leaving "inner cap" both in cell.text AND
       // as uncovered gap text. Fix: only outermost-own caption shadows;
       // nested table captions remain inside the outer table's body range.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<table><tbody><tr><td>'
           '<table><caption>inner cap</caption>'
@@ -967,16 +1058,16 @@ void main() {
           '</td></tr></tbody></table>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final tables =
-          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      final tables = blocks
+          .where((b) => b.type == ContentBlockType.table)
+          .toList();
       final captions = blocks
           .where(
             (b) =>
                 b.type == ContentBlockType.paragraph &&
                 b.marks.any(
                   (m) =>
-                      m.type == InlineMarkType.emphasis &&
-                      m.style == 'italic',
+                      m.type == InlineMarkType.emphasis && m.style == 'italic',
                 ),
           )
           .toList();
@@ -1006,8 +1097,10 @@ void main() {
       final outerTable = parsed!.annotations.firstWhere(
         (b) => b.type == ContentBlockType.table,
       );
-      final outerSubstring =
-          cleaned.text.substring(outerTable.start, outerTable.end);
+      final outerSubstring = cleaned.text.substring(
+        outerTable.start,
+        outerTable.end,
+      );
       expect(outerSubstring, contains('inner cap'));
     });
 
@@ -1017,22 +1110,23 @@ void main() {
       // position. With caption after tbody in DOM, table.start < caption.start;
       // the builder must emit table first (otherwise searchFrom advances
       // past caption and the table block is claim+skipped).
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<table><tbody><tr><td>cell</td></tr></tbody>'
           '<caption>cap</caption></table>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final tables =
-          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      final tables = blocks
+          .where((b) => b.type == ContentBlockType.table)
+          .toList();
       final captions = blocks
           .where(
             (b) =>
                 b.type == ContentBlockType.paragraph &&
                 b.marks.any(
                   (m) =>
-                      m.type == InlineMarkType.emphasis &&
-                      m.style == 'italic',
+                      m.type == InlineMarkType.emphasis && m.style == 'italic',
                 ),
           )
           .toList();
@@ -1052,23 +1146,24 @@ void main() {
       // Acceptable v1.2 trade-off: malformed (caption-mid-table) input
       // loses caption styling but rows render once, in the correct table
       // widget.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<table><thead><tr><th>HEAD</th></tr></thead>'
           '<caption>CAP</caption>'
           '<tbody><tr><td>BODY</td></tr></tbody></table>'
           '</body></html>';
       final blocks = buildFromFullPipeline(html);
-      final tables =
-          blocks.where((b) => b.type == ContentBlockType.table).toList();
+      final tables = blocks
+          .where((b) => b.type == ContentBlockType.table)
+          .toList();
       final captions = blocks
           .where(
             (b) =>
                 b.type == ContentBlockType.paragraph &&
                 b.marks.any(
                   (m) =>
-                      m.type == InlineMarkType.emphasis &&
-                      m.style == 'italic',
+                      m.type == InlineMarkType.emphasis && m.style == 'italic',
                 ),
           )
           .toList();
@@ -1107,7 +1202,8 @@ void main() {
       // Senior round-final LOW-4: pin the documented limit so a future
       // refactor that lifts the block-shadow rule in findCaptionAncestor
       // breaks loudly here instead of silently.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<table><caption><p>cap</p></caption>'
           '<tbody><tr><td>cell</td></tr></tbody></table>'
@@ -1132,8 +1228,7 @@ void main() {
                 b.type == ContentBlockType.paragraph &&
                 b.marks.any(
                   (m) =>
-                      m.type == InlineMarkType.emphasis &&
-                      m.style == 'italic',
+                      m.type == InlineMarkType.emphasis && m.style == 'italic',
                 ),
           )
           .toList();
@@ -1158,7 +1253,8 @@ void main() {
       // separately walked since <td> isn't a block container). All cell
       // text and pre text remain in plainText as orphan plain content;
       // hash still validates. Acknowledged v1.2 limit.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<table><tr><td>before<pre>code body</pre>after</td></tr></table>'
           '</body></html>';
@@ -1183,7 +1279,8 @@ void main() {
       // Senior round-final LOW-6: structural invariant covering all
       // block types. Catches accidental overlap regressions (e.g. the
       // round-final LOW-1 caption-after-rows case before its fix).
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<h2>Heading</h2>'
           '<p>Some prose with <code>inline</code> code.</p>'
@@ -1201,7 +1298,8 @@ void main() {
         expect(
           blocks[i].start,
           greaterThanOrEqualTo(blocks[i - 1].start),
-          reason: 'block at index $i (start=${blocks[i].start}) is '
+          reason:
+              'block at index $i (start=${blocks[i].start}) is '
               'before previous block (start=${blocks[i - 1].start})',
         );
       }
@@ -1210,14 +1308,16 @@ void main() {
         expect(
           blocks[i].start,
           greaterThanOrEqualTo(blocks[i - 1].end),
-          reason: 'block at index $i [${blocks[i].start}, ${blocks[i].end}) '
+          reason:
+              'block at index $i [${blocks[i].start}, ${blocks[i].end}) '
               'overlaps previous [${blocks[i - 1].start}, ${blocks[i - 1].end})',
         );
       }
     });
 
     test('hash validates over plain text for table fixture', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<table><caption>caption text</caption>'
           '<thead><tr><th>H</th></tr></thead>'
@@ -1240,7 +1340,8 @@ void main() {
         'nextFragmentId)', () {
       // Codex round-1 MEDIUM: _extractUntilElement previously skipped
       // li/dtdd sync, so leading sections produced no listItem blocks.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ul><li>One</li><li>Two</li></ul>'
           '<h2 id="next">Next section</h2>'
@@ -1268,8 +1369,7 @@ void main() {
   // ---------------------------------------------------------------------
   // listItem inline marks (Fix 3) + inline-mark cursor (Fix 2) + flow (Fix 1)
   // ---------------------------------------------------------------------
-  group('EpubStructuredContentBuilder.build (v1.0) — listItem inline marks',
-      () {
+  group('EpubStructuredContentBuilder.build (v1.0) — listItem inline marks', () {
     List<ContentBlock> buildFromFullPipeline(String html) {
       final raw = extractStructured(html);
       final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(raw);
@@ -1287,7 +1387,8 @@ void main() {
 
     test('Fix 3 — sibling same-text <code>X</code> siblings emit at distinct '
         'offsets', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ol><li>foo <code>X</code> middle <code>X</code> end</li></ol>'
           '</body></html>';
@@ -1309,7 +1410,8 @@ void main() {
     });
 
     test('Fix 3 — different-text <code> siblings have distinct lengths', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ol><li><code>foo</code> and <code>longer_bar</code></li></ol>'
           '</body></html>';
@@ -1327,40 +1429,42 @@ void main() {
       expect(lengths, containsAll(<int>[3, 10]));
     });
 
-    test('Fix 3 — cpp20-shaped TOC entry emits two distinct monospace marks',
-        () {
-      const html = '<html><body>'
-          '<p>Padding so the chapter exceeds fifty characters total here.</p>'
-          '<nav><ol>'
-          '<li><a href="chap02.xhtml#x">'
-          '<span class="section-number">1.3 </span>'
-          'Defining <code>operator&lt;=&gt;</code> and <code>operator==</code>'
-          '</a></li>'
-          '</ol></nav>'
-          '</body></html>';
-      final blocks = buildFromFullPipeline(html);
-      final listItems = blocks
-          .where((b) => b.type == ContentBlockType.listItem)
-          .toList(growable: false);
-      expect(listItems, hasLength(1));
-      final li = listItems.single;
-      final monos = li.marks
-          .where((m) => m.type == InlineMarkType.monospace)
-          .toList();
-      expect(monos, hasLength(2));
-      // operator<=> = 11 chars; operator== = 10 chars.
-      final lengths = monos.map((m) => m.end - m.start).toList();
-      expect(lengths, containsAll(<int>[11, 10]));
-      // Distinct offsets, both within the listItem range.
-      expect(monos[0].start, isNot(monos[1].start));
-      for (final m in monos) {
-        expect(m.start, greaterThanOrEqualTo(li.start));
-        expect(m.end, lessThanOrEqualTo(li.end));
-      }
-    });
+    test(
+      'Fix 3 — cpp20-shaped TOC entry emits two distinct monospace marks',
+      () {
+        const html =
+            '<html><body>'
+            '<p>Padding so the chapter exceeds fifty characters total here.</p>'
+            '<nav><ol>'
+            '<li><a href="chap02.xhtml#x">'
+            '<span class="section-number">1.3 </span>'
+            'Defining <code>operator&lt;=&gt;</code> and <code>operator==</code>'
+            '</a></li>'
+            '</ol></nav>'
+            '</body></html>';
+        final blocks = buildFromFullPipeline(html);
+        final listItems = blocks
+            .where((b) => b.type == ContentBlockType.listItem)
+            .toList(growable: false);
+        expect(listItems, hasLength(1));
+        final li = listItems.single;
+        final monos = li.marks
+            .where((m) => m.type == InlineMarkType.monospace)
+            .toList();
+        expect(monos, hasLength(2));
+        // operator<=> = 11 chars; operator== = 10 chars.
+        final lengths = monos.map((m) => m.end - m.start).toList();
+        expect(lengths, containsAll(<int>[11, 10]));
+        // Distinct offsets, both within the listItem range.
+        expect(monos[0].start, isNot(monos[1].start));
+        for (final m in monos) {
+          expect(m.start, greaterThanOrEqualTo(li.start));
+          expect(m.end, lessThanOrEqualTo(li.end));
+        }
+      },
+    );
 
-    test('Fix 3 — slice 2-only <code> emits on slice 2, not slice 1',
-        () {
+    test('Fix 3 — slice 2-only <code> emits on slice 2, not slice 1', () {
       // <p>BLOCK</p> splits the <li> into two slices. The <code> tag
       // sits wholly in slice 2. The slice-membership counter filters
       // the <code> out of slice 1's mark walk before _matchInlineMark
@@ -1368,7 +1472,8 @@ void main() {
       // inside _matchInlineMark is no longer driven by this fixture
       // since the slice counter rejects earlier — kept anyway as a
       // safety net for non-trivial cleaner remappings.)
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters total here.</p>'
           '<ol>'
           '<li>prefix text run <p>BLOCK</p> '
@@ -1386,9 +1491,13 @@ void main() {
       final slice1Monos = listItems[0].marks
           .where((m) => m.type == InlineMarkType.monospace)
           .toList();
-      expect(slice1Monos, isEmpty,
-          reason: 'slice-membership counter must filter slice-2 <code> '
-              'out of slice 1\'s mark walk');
+      expect(
+        slice1Monos,
+        isEmpty,
+        reason:
+            'slice-membership counter must filter slice-2 <code> '
+            'out of slice 1\'s mark walk',
+      );
       // Slice 2 has exactly one monospace mark for the <code>.
       final slice2Monos = listItems[1].marks
           .where((m) => m.type == InlineMarkType.monospace)
@@ -1421,7 +1530,8 @@ void main() {
       // so the overflow branch is no longer driven here. The overflow
       // guard remains as defense-in-depth — see _matchInlineMark in
       // epub_structured_content_builder.dart for its semantic.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters total here.</p>'
           '<ol>'
           '<li>aaa <code>bbb</code> filler text bbbcccddd '
@@ -1440,9 +1550,13 @@ void main() {
       // EXACTLY one mark — the first <code>bbb</code> (3 chars). The
       // slice-membership filter prevents the slice-2 <code>bbbcccddd</code>
       // from matching the plain text "bbbcccddd" inside slice 1.
-      expect(slice1Monos, hasLength(1),
-          reason: 'slice 1 must emit exactly 1 monospace mark; got '
-              '${slice1Monos.length}: ${slice1Monos.map((m) => "[${m.start},${m.end})").toList()}');
+      expect(
+        slice1Monos,
+        hasLength(1),
+        reason:
+            'slice 1 must emit exactly 1 monospace mark; got '
+            '${slice1Monos.length}: ${slice1Monos.map((m) => "[${m.start},${m.end})").toList()}',
+      );
       expect(slice1Monos.single.end - slice1Monos.single.start, 3);
 
       // Slice 2 emits exactly 1 monospace mark for <code>bbbcccddd</code> (9 chars).
@@ -1453,11 +1567,11 @@ void main() {
       expect(slice2Monos.single.end - slice2Monos.single.start, 9);
     });
 
-    test('Fix 2 — sibling overflow positive control: 2 marks fit cleanly',
-        () {
+    test('Fix 2 — sibling overflow positive control: 2 marks fit cleanly', () {
       // Positive control matched to test 4b: same shape but the second
       // <code> is shorter and fits cleanly within slice 1's bound.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters total here.</p>'
           '<ol>'
           '<li>aaa <code>bbb</code> mid <code>ccc</code> tail '
@@ -1485,31 +1599,35 @@ void main() {
       }
     });
 
-    test('Fix 2 — heading inline marks: <h2>foo <code>X</code> and <code>X</code></h2>',
-        () {
-      const html = '<html><body>'
-          '<p>Padding so the chapter exceeds fifty characters total here.</p>'
-          '<h2>foo <code>X</code> and <code>X</code></h2>'
-          '</body></html>';
-      final blocks = buildFromFullPipeline(html);
-      final headings = blocks
-          .where((b) => b.type == ContentBlockType.heading)
-          .toList(growable: false);
-      expect(headings, hasLength(1));
-      final h = headings.single;
-      final monos = h.marks
-          .where((m) => m.type == InlineMarkType.monospace)
-          .toList();
-      expect(monos, hasLength(2));
-      expect(monos[0].start, isNot(monos[1].start));
-    });
+    test(
+      'Fix 2 — heading inline marks: <h2>foo <code>X</code> and <code>X</code></h2>',
+      () {
+        const html =
+            '<html><body>'
+            '<p>Padding so the chapter exceeds fifty characters total here.</p>'
+            '<h2>foo <code>X</code> and <code>X</code></h2>'
+            '</body></html>';
+        final blocks = buildFromFullPipeline(html);
+        final headings = blocks
+            .where((b) => b.type == ContentBlockType.heading)
+            .toList(growable: false);
+        expect(headings, hasLength(1));
+        final h = headings.single;
+        final monos = h.marks
+            .where((m) => m.type == InlineMarkType.monospace)
+            .toList();
+        expect(monos, hasLength(2));
+        expect(monos[0].start, isNot(monos[1].start));
+      },
+    );
 
     test('Fix 1 — spine-only synthetic chapter emits listItems and marks; no '
         '<head><title> leak', () {
       // Synthetic well-formed <nav><h2><ol><li> document. Pass through
       // extractStructured + EpubStructuredContentBuilder.build (mirrors
       // the v1.0 spine-only flow after Fix 1).
-      const html = '<html><head><title>Ignore Me</title></head><body><nav>'
+      const html =
+          '<html><head><title>Ignore Me</title></head><body><nav>'
           '<h2>TOC</h2>'
           '<ol>'
           '<li><a href="ch01.xhtml">Chapter 1: <code>vector</code></a></li>'
@@ -1572,9 +1690,13 @@ void main() {
         final c = plainText.codeUnitAt(i);
         final isWs = c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D;
         if (!isWs) {
-          expect(covered[i], isTrue,
-              reason: 'char at offset $i ("${plainText[i]}") not covered '
-                  'by any block in spine-only synthetic fixture');
+          expect(
+            covered[i],
+            isTrue,
+            reason:
+                'char at offset $i ("${plainText[i]}") not covered '
+                'by any block in spine-only synthetic fixture',
+          );
         }
       }
 
@@ -1588,16 +1710,21 @@ void main() {
         final seen = <String>{};
         for (final m in b.marks) {
           final key = '${m.start}-${m.end}';
-          expect(seen.contains(key), isFalse,
-              reason: 'duplicate mark offsets in single block at '
-                  '[${b.start}, ${b.end})');
+          expect(
+            seen.contains(key),
+            isFalse,
+            reason:
+                'duplicate mark offsets in single block at '
+                '[${b.start}, ${b.end})',
+          );
           seen.add(key);
         }
       }
     });
 
     test('Fix 5 — extractStructured does not leak <head><title> text', () {
-      const html = '<html><head><title>HEADTEXT</title></head>'
+      const html =
+          '<html><head><title>HEADTEXT</title></head>'
           '<body><h2>BODYTEXT</h2>'
           '<p>Padding so the chapter exceeds fifty characters total here.</p>'
           '</body></html>';
@@ -1608,7 +1735,8 @@ void main() {
 
     test('Fix 5 — extractSectionStructured(_, null, null) does not leak '
         '<head><title> text', () {
-      const html = '<html><head><title>HEADTEXT</title></head>'
+      const html =
+          '<html><head><title>HEADTEXT</title></head>'
           '<body><h2>BODYTEXT</h2>'
           '<p>Padding so the chapter exceeds fifty characters total here.</p>'
           '</body></html>';
@@ -1626,7 +1754,8 @@ void main() {
       // listItem's start to ctx.searchFrom rather than suppress, so every
       // inner item emits. Reproduces the cpp20.epub TOC bug uncovered by
       // Fix 1.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<h2>Heading</h2>'
           '<nav><ol class="toc">\n'
           '  <li>\n'
@@ -1655,10 +1784,14 @@ void main() {
       // Strict monotonic: each block's end <= next block's start (after
       // clamp, blocks are adjacent or non-overlapping).
       for (var i = 1; i < listItems.length; i++) {
-        expect(listItems[i].start, greaterThanOrEqualTo(listItems[i - 1].end),
-            reason: 'listItem[$i] [${listItems[i].start}, '
-                '${listItems[i].end}) overlaps prior '
-                '[${listItems[i - 1].start}, ${listItems[i - 1].end})');
+        expect(
+          listItems[i].start,
+          greaterThanOrEqualTo(listItems[i - 1].end),
+          reason:
+              'listItem[$i] [${listItems[i].start}, '
+              '${listItems[i].end}) overlaps prior '
+              '[${listItems[i - 1].start}, ${listItems[i - 1].end})',
+        );
       }
     });
 
@@ -1667,7 +1800,8 @@ void main() {
       // Regression for codex round-7 MEDIUM: an empty <a></a> or an
       // inline wrapper whose first content is a block must NOT advance
       // the slice counter. Only actual non-ws TEXT advances hadContent.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters total here.</p>'
           '<ol>'
           '<li>'
@@ -1690,9 +1824,13 @@ void main() {
       final monos = listItems.single.marks
           .where((m) => m.type == InlineMarkType.monospace)
           .toList();
-      expect(monos, hasLength(1),
-          reason: 'leading empty <a></a> must not advance slice counter; '
-              'trailing <code>uniqcode</code> stays in slice 0');
+      expect(
+        monos,
+        hasLength(1),
+        reason:
+            'leading empty <a></a> must not advance slice counter; '
+            'trailing <code>uniqcode</code> stays in slice 0',
+      );
       expect(monos.single.end - monos.single.start, 8);
     });
 
@@ -1706,7 +1844,8 @@ void main() {
       // the trailing <code>uniqcode</code>'s slice index (0 in
       // elementRanges) wouldn't match the walker's counter (1 after
       // seeing the leading <ul>), and the mark would be silently dropped.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters total here.</p>'
           '<ol>'
           '<li>'
@@ -1729,16 +1868,18 @@ void main() {
       final liWithUniqMark = listItems
           .where(
             (li) => li.marks.any(
-              (m) =>
-                  m.type == InlineMarkType.monospace &&
-                  m.end - m.start == 8,
+              (m) => m.type == InlineMarkType.monospace && m.end - m.start == 8,
             ),
           )
           .toList(growable: false);
-      expect(liWithUniqMark, hasLength(1),
-          reason: 'outer <li>\'s slice 0 must carry the <code>uniqcode</code> '
-              'monospace mark; without the hadContent guard, the leading '
-              '<ul> would over-count to slice 1 and drop the mark');
+      expect(
+        liWithUniqMark,
+        hasLength(1),
+        reason:
+            'outer <li>\'s slice 0 must carry the <code>uniqcode</code> '
+            'monospace mark; without the hadContent guard, the leading '
+            '<ul> would over-count to slice 1 and drop the mark',
+      );
     });
 
     test('Fix 3 — listItem bounds trim leading/trailing whitespace', () {
@@ -1751,7 +1892,8 @@ void main() {
       //   - Each listItem's first and last char (within bounds) is
       //     non-whitespace.
       //   - listItem.end <= next listItem.start (gap = whitespace).
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<h2>Heading</h2>'
           '<nav><ol class="toc">\n'
           '  <li><a href="#a">First Item</a></li>\n'
@@ -1777,25 +1919,36 @@ void main() {
       expect(listItems, hasLength(3));
       // Every listItem's first and last char (within bounds) is
       // non-whitespace.
-      bool isWs(int c) =>
-          c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D;
+      bool isWs(int c) => c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D;
       for (final li in listItems) {
         expect(li.end, greaterThan(li.start));
-        expect(isWs(plainText.codeUnitAt(li.start)), isFalse,
-            reason: 'listItem at [${li.start}, ${li.end}) starts with '
-                'whitespace "${plainText[li.start]}"; bounds should be '
-                'trimmed');
-        expect(isWs(plainText.codeUnitAt(li.end - 1)), isFalse,
-            reason: 'listItem at [${li.start}, ${li.end}) ends with '
-                'whitespace; bounds should be trimmed');
+        expect(
+          isWs(plainText.codeUnitAt(li.start)),
+          isFalse,
+          reason:
+              'listItem at [${li.start}, ${li.end}) starts with '
+              'whitespace "${plainText[li.start]}"; bounds should be '
+              'trimmed',
+        );
+        expect(
+          isWs(plainText.codeUnitAt(li.end - 1)),
+          isFalse,
+          reason:
+              'listItem at [${li.start}, ${li.end}) ends with '
+              'whitespace; bounds should be trimmed',
+        );
       }
       // Adjacent listItems: gap between them is pure whitespace.
       for (var i = 1; i < listItems.length; i++) {
         expect(listItems[i].start, greaterThanOrEqualTo(listItems[i - 1].end));
         for (var j = listItems[i - 1].end; j < listItems[i].start; j++) {
-          expect(isWs(plainText.codeUnitAt(j)), isTrue,
-              reason: 'gap char at offset $j between listItems must be '
-                  'whitespace');
+          expect(
+            isWs(plainText.codeUnitAt(j)),
+            isTrue,
+            reason:
+                'gap char at offset $j between listItems must be '
+                'whitespace',
+          );
         }
       }
     });
@@ -1814,7 +1967,8 @@ void main() {
       //   - The slice 1 listItem has NO monospace marks (the slice-counter
       //     filter prevents misattribution)
       //   - First-slice listMarker = '1.', second-slice listMarker = ''
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters total here.</p>'
           '<ol><li>foo <a href="#"><p>BLOCK</p></a> bar '
           '<code>uniquetag</code></li></ol>'
@@ -1833,28 +1987,40 @@ void main() {
       // <p>BLOCK</p> emits a separate paragraph block in DOM order
       // (between slice 1 and slice 2 of the listItem).
       final blockParagraphs = blocks
-          .where((b) =>
-              b.type == ContentBlockType.paragraph &&
-              b.start >= listItems[0].end &&
-              b.end <= listItems[1].start)
+          .where(
+            (b) =>
+                b.type == ContentBlockType.paragraph &&
+                b.start >= listItems[0].end &&
+                b.end <= listItems[1].start,
+          )
           .toList();
-      expect(blockParagraphs, isNotEmpty,
-          reason: '<p>BLOCK</p> should emit a paragraph block between '
-              'the two listItem slices');
+      expect(
+        blockParagraphs,
+        isNotEmpty,
+        reason:
+            '<p>BLOCK</p> should emit a paragraph block between '
+            'the two listItem slices',
+      );
       // Slice 2 carries the monospace mark for <code>uniquetag</code>.
       final slice2Monos = listItems[1].marks
           .where((m) => m.type == InlineMarkType.monospace)
           .toList();
       expect(slice2Monos, hasLength(1));
-      expect(slice2Monos.single.end - slice2Monos.single.start, 9,
-          reason: '<code>uniquetag</code> is 9 chars');
+      expect(
+        slice2Monos.single.end - slice2Monos.single.start,
+        9,
+        reason: '<code>uniquetag</code> is 9 chars',
+      );
       // Slice 1 has no monospace marks (slice-counter filter prevents
       // attributing slice-2's <code> to slice 1).
       final slice1Monos = listItems[0].marks
           .where((m) => m.type == InlineMarkType.monospace)
           .toList();
-      expect(slice1Monos, isEmpty,
-          reason: 'slice 1 must not pick up slice 2\'s <code>uniquetag</code>');
+      expect(
+        slice1Monos,
+        isEmpty,
+        reason: 'slice 1 must not pick up slice 2\'s <code>uniquetag</code>',
+      );
     });
   });
 
@@ -1875,19 +2041,21 @@ void main() {
     }
 
     test('top-level <li>s have depth 0', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ul><li>Apples</li><li>Bananas</li></ul>'
           '</body></html>';
-      final items = buildFromFullPipeline(html)
-          .where((b) => b.type == ContentBlockType.listItem)
-          .toList();
+      final items = buildFromFullPipeline(
+        html,
+      ).where((b) => b.type == ContentBlockType.listItem).toList();
       expect(items, hasLength(2));
       expect(items.every((b) => b.depth == 0), isTrue);
     });
 
     test('direct nesting: depth 0/1/2 for <ol><li><ol><li><ol><li>...', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ol><li>A'
           '<ol><li>B'
@@ -1895,9 +2063,9 @@ void main() {
           '</li></ol>'
           '</li></ol>'
           '</body></html>';
-      final items = buildFromFullPipeline(html)
-          .where((b) => b.type == ContentBlockType.listItem)
-          .toList();
+      final items = buildFromFullPipeline(
+        html,
+      ).where((b) => b.type == ContentBlockType.listItem).toList();
       expect(items, hasLength(3));
       // Items are emitted in DOM-walk order: outer first, then inner, then
       // innermost.
@@ -1907,38 +2075,41 @@ void main() {
     });
 
     test(
-        'wrapped block container preserves depth: <li><div><ul><li>Inner</li></ul></div></li>',
-        () {
-      // Load-bearing case: the inner <ul> is reached via _walkLiNode →
-      // _dispatchNode → _recurseIntoBlockContainer → _walkBlocks →
-      // _emitListContainerIfApplicable. DOM-ancestor counting catches
-      // this; threading a depth parameter through every dispatcher would
-      // miss it.
-      const html = '<html><body>'
-          '<p>Padding so the chapter exceeds fifty characters here.</p>'
-          '<ul><li>Outer'
-          '<div><ul><li>Inner</li></ul></div>'
-          '</li></ul>'
-          '</body></html>';
-      final items = buildFromFullPipeline(html)
-          .where((b) => b.type == ContentBlockType.listItem)
-          .toList();
-      expect(items, hasLength(2));
-      // First emitted is Outer's first slice, then Inner.
-      final outer = items.firstWhere((b) => b.depth == 0);
-      final inner = items.firstWhere((b) => b.depth == 1);
-      expect(outer, isNotNull);
-      expect(inner, isNotNull);
-    });
+      'wrapped block container preserves depth: <li><div><ul><li>Inner</li></ul></div></li>',
+      () {
+        // Load-bearing case: the inner <ul> is reached via _walkLiNode →
+        // _dispatchNode → _recurseIntoBlockContainer → _walkBlocks →
+        // _emitListContainerIfApplicable. DOM-ancestor counting catches
+        // this; threading a depth parameter through every dispatcher would
+        // miss it.
+        const html =
+            '<html><body>'
+            '<p>Padding so the chapter exceeds fifty characters here.</p>'
+            '<ul><li>Outer'
+            '<div><ul><li>Inner</li></ul></div>'
+            '</li></ul>'
+            '</body></html>';
+        final items = buildFromFullPipeline(
+          html,
+        ).where((b) => b.type == ContentBlockType.listItem).toList();
+        expect(items, hasLength(2));
+        // First emitted is Outer's first slice, then Inner.
+        final outer = items.firstWhere((b) => b.depth == 0);
+        final inner = items.firstWhere((b) => b.depth == 1);
+        expect(outer, isNotNull);
+        expect(inner, isNotNull);
+      },
+    );
 
     test('mixed container types: <ol><li><ul><li>...', () {
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ol><li>A1<ul><li>A1a</li><li>A1b</li></ul></li></ol>'
           '</body></html>';
-      final items = buildFromFullPipeline(html)
-          .where((b) => b.type == ContentBlockType.listItem)
-          .toList();
+      final items = buildFromFullPipeline(
+        html,
+      ).where((b) => b.type == ContentBlockType.listItem).toList();
       expect(items, hasLength(3));
       // First emit is A1 (top-level), then A1a + A1b (nested).
       expect(items[0].depth, 0);
@@ -1950,20 +2121,22 @@ void main() {
       // <li> with mid-slice <p> block descendant produces multiple listItem
       // slices for the same <li>. All slices must share the parent <li>'s
       // depth.
-      const html = '<html><body>'
+      const html =
+          '<html><body>'
           '<p>Padding so the chapter exceeds fifty characters here.</p>'
           '<ul><li>Outer head<p>Inline para</p>Outer tail'
           '<ul><li>Inner</li></ul>'
           '</li></ul>'
           '</body></html>';
-      final items = buildFromFullPipeline(html)
-          .where((b) => b.type == ContentBlockType.listItem)
-          .toList();
+      final items = buildFromFullPipeline(
+        html,
+      ).where((b) => b.type == ContentBlockType.listItem).toList();
       // Every Outer slice should carry depth 0; the Inner item depth 1.
       // We don't pin the exact emission count (slice trimming may collapse)
       // but assert the depth invariant.
-      final depthsByMarker =
-          items.map((b) => '${b.listMarker}:${b.depth}').toList();
+      final depthsByMarker = items
+          .map((b) => '${b.listMarker}:${b.depth}')
+          .toList();
       // Top-level Outer slice(s) have listMarker='•' on first slice and ''
       // on continuations; either way depth must be 0.
       final outerDepths = items
@@ -1974,10 +2147,16 @@ void main() {
           .where((b) => b.depth == 1)
           .map((b) => b.depth)
           .toSet();
-      expect(outerDepths, equals({0}),
-          reason: 'all Outer slices share depth 0 (got $depthsByMarker)');
-      expect(innerDepths, equals({1}),
-          reason: 'Inner has depth 1 (got $depthsByMarker)');
+      expect(
+        outerDepths,
+        equals({0}),
+        reason: 'all Outer slices share depth 0 (got $depthsByMarker)',
+      );
+      expect(
+        innerDepths,
+        equals({1}),
+        reason: 'Inner has depth 1 (got $depthsByMarker)',
+      );
     });
   });
 }

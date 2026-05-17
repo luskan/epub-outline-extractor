@@ -155,7 +155,10 @@ class EpubExtractor {
       collectSpineOrder(chapter);
     }
 
-    final tocEntries = _buildTocFromChapters(epubBook.chapters, null, 0);
+    final navigationPoints = epubBook.schema?.navigation?.navMap?.points;
+    final tocEntries = navigationPoints != null && navigationPoints.isNotEmpty
+        ? _buildTocFromNavigationPoints(navigationPoints, null, 0)
+        : _buildTocFromChapters(epubBook.chapters, null, 0);
 
     return EpubData(
       metadata: metadata,
@@ -163,6 +166,85 @@ class EpubExtractor {
       tocEntries: tocEntries,
       opfDir: '',
     );
+  }
+
+  /// Build TocEntry tree from the raw EPUB NAV/NCX map.
+  ///
+  /// `epub_pro` reconciles chapters by spine position after parsing the NAV.
+  /// Google Docs EPUBs commonly put every TOC anchor in one XHTML spine file;
+  /// when chapter reconciliation keys by spine position, same-file top-level
+  /// anchors overwrite each other. The schema navigation map still contains
+  /// the full TOC, so section extraction must build from it directly.
+  List<TocEntry> _buildTocFromNavigationPoints(
+    List<EpubNavigationPoint> points,
+    String? parentTitle,
+    int depth,
+  ) {
+    final entries = <TocEntry>[];
+
+    for (final point in points) {
+      final childEntries = point.childNavigationPoints.isNotEmpty
+          ? _buildTocFromNavigationPoints(
+              point.childNavigationPoints,
+              _navigationPointTitle(point),
+              depth + 1,
+            )
+          : <TocEntry>[];
+
+      var title = _navigationPointTitle(point);
+      if (point.childNavigationPoints.isNotEmpty &&
+          point.childNavigationPoints.first.navigationLabels.isNotEmpty) {
+        final firstChildTitle = _navigationPointTitle(
+          point.childNavigationPoints.first,
+        );
+        final strippedChildTitle = TextParsingUtils.stripPartPrefix(
+          firstChildTitle,
+        ).trim();
+        if (strippedChildTitle.toLowerCase() == title.toLowerCase()) {
+          title = firstChildTitle;
+        }
+      }
+
+      entries.add(
+        TocEntry(
+          title: title,
+          href: _normalizeNavigationHref(point.content?.source),
+          parentTitle: parentTitle,
+          depth: depth,
+          children: childEntries,
+        ),
+      );
+    }
+
+    return entries;
+  }
+
+  String _navigationPointTitle(EpubNavigationPoint point) {
+    for (final label in point.navigationLabels) {
+      final text = label.text?.trim();
+      if (text != null && text.isNotEmpty) return text;
+    }
+    return 'Untitled';
+  }
+
+  String? _normalizeNavigationHref(String? href) {
+    final value = href?.trim();
+    if (value == null || value.isEmpty) return null;
+
+    final hashIndex = value.indexOf('#');
+    if (hashIndex < 0) return _decodeHrefPath(value);
+
+    final path = value.substring(0, hashIndex);
+    final fragment = value.substring(hashIndex + 1);
+    return '${_decodeHrefPath(path)}#$fragment';
+  }
+
+  String _decodeHrefPath(String value) {
+    try {
+      return Uri.decodeFull(value);
+    } catch (_) {
+      return value;
+    }
   }
 
   /// Build TocEntry tree from epub_pro chapters.
@@ -281,11 +363,10 @@ class EpubExtractor {
 
   /// Build the hierarchical TOC tree as `List<BookSection>`.
   ///
-  /// Mirrors the original [TocEntry] tree up to depth 1 (legacy
-  /// `_flattenToc(maxDepth: 1)` policy): depth-0 entries' [BookSection]s
-  /// have their depth-1 children nested as `subsections`. Depth-2+ entries
-  /// are not emitted; their text is merged into the depth-1 parent's
-  /// section text by `extractSectionText`'s heading-stop logic.
+  /// Mirrors the original [TocEntry] tree at all depths. Older imports only
+  /// kept depth 0 and depth 1, but same-level Google Docs headings can be
+  /// nested in the NAV; dropping depth 2+ then loses content because the
+  /// section extractor stops at the next same-level heading.
   ///
   /// Each section's [BookSection.location] (an [EpubChapterLocation])
   /// reflects the entry's own href — its `spineIndex` may differ from its
@@ -311,30 +392,23 @@ class EpubExtractor {
       collectHtml(chapter);
     }
 
-    // Flatten the TOC tree at maxDepth=1 (legacy behavior). Depth-2+
-    // entries are silently dropped here; their text is captured by the
-    // surrounding depth-1 section's extracted text via heading-stop logic.
-    // The flat list preserves DFS pre-order so we can compute next-fragment
-    // bounds locally.
     final tocFlat = _flattenToc(epubData.tocEntries);
     if (tocFlat.isNotEmpty) {
       onProgress?.call(0, tocFlat.length);
     }
 
     // Build a flat parallel list of BookSections in tocFlat order, then
-    // reconstruct the depth-0/depth-1 hierarchy from `parentTitle`. We
-    // need the flat ordering for next-fragment bound computation, but we
-    // emit a hierarchical tree so the adapter can recover legacy
-    // `parentTitle` semantics (depth-0 → null, depth-1 → parent's title).
+    // reconstruct the full hierarchy. We need the flat ordering for
+    // next-fragment bound computation, but we emit a hierarchical tree so the
+    // adapter can recover legacy `parentTitle` semantics from immediate
+    // parent relationships.
     //
-    // Virtual placeholders: depth-0 entries with no href (or whose href
-    // points to a missing chapter) still get a [BookSection] with a
-    // sentinel location (`spineIndex: -1, href: null`) and empty
-    // [content]. The mobile adapter recognises this sentinel and skips
-    // emitting a SectionData for the placeholder itself, but still emits
-    // its depth-1 children with `parentTitle = placeholder.title` —
-    // matching legacy `_extractSectionsFromToc` behavior where the
-    // skipped parent's children kept being processed independently.
+    // Virtual placeholders: entries with no href (or whose href points to a
+    // missing chapter) still get a [BookSection] when they have children. The
+    // mobile adapter recognises the sentinel location (`spineIndex: -1,
+    // href: null`) and skips emitting a SectionData for the placeholder
+    // itself, but still emits descendants with `parentTitle =
+    // placeholder.title`.
     final flatBookSections = <BookSection?>[];
     final documentTitleWrapperIndexes = <int>{};
 
@@ -350,7 +424,7 @@ class EpubExtractor {
       if (tocItem.href == null) {
         _logger.fine('SKIPPED: "${tocItem.title}" - no href');
         flatBookSections.add(
-          tocItem.depth == 0 ? virtualPlaceholder(tocItem.title) : null,
+          tocItem.isSection ? virtualPlaceholder(tocItem.title) : null,
         );
         continue;
       }
@@ -361,20 +435,19 @@ class EpubExtractor {
       if (chapterIndex == -1) {
         _logger.fine('SKIPPED: "${tocItem.title}" - chapter not found: $file');
         flatBookSections.add(
-          tocItem.depth == 0 ? virtualPlaceholder(tocItem.title) : null,
+          tocItem.isSection ? virtualPlaceholder(tocItem.title) : null,
         );
         continue;
       }
 
-      if (_isDocumentTitleWrapper(
+      final isDocumentTitleWrapper = _isDocumentTitleWrapper(
         tocItem,
         documentTitle: epubBook.title,
         fragment: fragment,
-      )) {
+      );
+      if (isDocumentTitleWrapper) {
         _logger.fine('SKIPPED: "${tocItem.title}" - document-title wrapper');
         documentTitleWrapperIndexes.add(i);
-        flatBookSections.add(virtualPlaceholder(tocItem.title));
-        continue;
       }
 
       // Find next fragment in same file (if any) — used as bound.
@@ -503,43 +576,141 @@ class EpubExtractor {
       );
     }
 
-    // Reconstruct depth-0/depth-1 hierarchy from tocFlat. tocFlat is
-    // pre-order DFS through depth ≤ 1, so depth-1 entries always follow
-    // their parent depth-0 entry contiguously.
+    // Reconstruct the original hierarchy from the flat DFS list. Processing
+    // from the end lets every node attach its already-built child list to
+    // the nearest preceding shallower item.
     final result = <BookSection>[];
-    for (var i = 0; i < tocFlat.length; i++) {
-      if (tocFlat[i].depth != 0) continue;
-      final parentSection = flatBookSections[i];
-      if (parentSection == null) continue;
+    final childBuckets = List<List<BookSection>>.generate(
+      tocFlat.length,
+      (_) => <BookSection>[],
+    );
 
-      // Collect this depth-0 entry's depth-1 children: scan forward until
-      // the next depth-0 entry.
-      final children = <BookSection>[];
-      for (var j = i + 1; j < tocFlat.length; j++) {
-        if (tocFlat[j].depth == 0) break;
-        final child = flatBookSections[j];
-        if (child != null) children.add(child);
-      }
+    for (var i = tocFlat.length - 1; i >= 0; i--) {
+      final children = childBuckets[i];
+      final section = flatBookSections[i];
+      final nodesToAttach = <BookSection>[];
 
       if (documentTitleWrapperIndexes.contains(i)) {
-        result.addAll(children);
-      } else if (children.isEmpty) {
-        result.add(parentSection);
+        final wrapper = section;
+        nodesToAttach.addAll(
+          wrapper == null
+              ? children
+              : _prependSectionContent(wrapper, children),
+        );
+      } else if (section != null) {
+        nodesToAttach.add(
+          children.isEmpty ? section : section.copyWith(subsections: children),
+        );
       } else {
-        result.add(parentSection.copyWith(subsections: children));
+        nodesToAttach.addAll(children);
+      }
+
+      if (nodesToAttach.isEmpty) continue;
+
+      final parentIndex = _findFlatParentIndex(tocFlat, i);
+      if (parentIndex == null) {
+        result.insertAll(0, nodesToAttach);
+      } else {
+        childBuckets[parentIndex].insertAll(0, nodesToAttach);
       }
     }
 
     return result;
   }
 
-  /// Flatten the TOC tree at [maxDepth]; preserves pre-order DFS order.
-  List<TocItemFlat> _flattenToc(List<TocEntry> tocEntries, {int maxDepth = 1}) {
+  List<BookSection> _prependSectionContent(
+    BookSection prefix,
+    List<BookSection> sections,
+  ) {
+    final prefixText = prefix.content.isNotEmpty ? prefix.content.first : '';
+    if (prefixText.trim().isEmpty || sections.isEmpty) return sections;
+
+    final first = sections.first;
+    final firstText = first.content.isNotEmpty ? first.content.first : '';
+    final separator = firstText.isEmpty ? '' : '\n\n';
+    final mergedText = '$prefixText$separator$firstText';
+    final mergedStructuredJson = _mergeStructuredContentJson(
+      prefix.structuredContentJson,
+      prefixText,
+      first.structuredContentJson,
+      firstText,
+      separator.length,
+      mergedText,
+    );
+
+    return [
+      first.copyWith(
+        content: [mergedText],
+        structuredContentJson: mergedStructuredJson,
+      ),
+      ...sections.skip(1),
+    ];
+  }
+
+  String? _mergeStructuredContentJson(
+    String? prefixJson,
+    String prefixText,
+    String? bodyJson,
+    String bodyText,
+    int separatorLength,
+    String mergedText,
+  ) {
+    final blocks = <ContentBlock>[];
+
+    final prefixContent = StructuredContent.tryParse(prefixJson);
+    if (prefixContent != null && prefixContent.isValidFor(prefixText)) {
+      blocks.addAll(prefixContent.annotations);
+    }
+
+    final bodyContent = StructuredContent.tryParse(bodyJson);
+    if (bodyContent != null && bodyContent.isValidFor(bodyText)) {
+      final offset = prefixText.length + separatorLength;
+      blocks.addAll(
+        bodyContent.annotations.map(
+          (block) => _shiftContentBlock(block, offset),
+        ),
+      );
+    }
+
+    if (blocks.isEmpty) {
+      return StructuredContentExtractor().extract(mergedText)?.toJsonString();
+    }
+    return StructuredContent.fromBlocks(mergedText, blocks)?.toJsonString();
+  }
+
+  ContentBlock _shiftContentBlock(ContentBlock block, int offset) {
+    return ContentBlock(
+      type: block.type,
+      start: block.start + offset,
+      end: block.end + offset,
+      level: block.level,
+      caption: block.caption,
+      imagePath: block.imagePath,
+      listMarker: block.listMarker,
+      definitionTermEnd: block.definitionTermEnd == null
+          ? null
+          : block.definitionTermEnd! + offset,
+      tableRows: block.tableRows,
+      preserveLineBreaks: block.preserveLineBreaks,
+      depth: block.depth,
+      marks: [
+        for (final mark in block.marks)
+          InlineMark(
+            type: mark.type,
+            start: mark.start + offset,
+            end: mark.end + offset,
+            url: mark.url,
+            style: mark.style,
+          ),
+      ],
+    );
+  }
+
+  /// Flatten the full TOC tree; preserves pre-order DFS order.
+  List<TocItemFlat> _flattenToc(List<TocEntry> tocEntries) {
     final flat = <TocItemFlat>[];
 
     void flatten(TocEntry entry, String? parentTitle) {
-      if (entry.depth > maxDepth) return;
-
       final isSection = entry.hasChildren;
       String? firstChildHref;
       if (isSection && entry.children.isNotEmpty) {
@@ -567,6 +738,16 @@ class EpubExtractor {
     }
 
     return flat;
+  }
+
+  int? _findFlatParentIndex(List<TocItemFlat> tocFlat, int index) {
+    final depth = tocFlat[index].depth;
+    if (depth <= 0) return null;
+
+    for (var i = index - 1; i >= 0; i--) {
+      if (tocFlat[i].depth < depth) return i;
+    }
+    return null;
   }
 
   bool _isHtmlFile(String filename) {
