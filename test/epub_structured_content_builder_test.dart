@@ -152,6 +152,27 @@ void main() {
       expect(blockText, endsWith('.'));
       expect(blockText, isNot(contains('Przykład')));
     });
+
+    test('fuzzy paragraph ranges preserve Google Docs indentation', () {
+      const html =
+          '<html><body>'
+          '<p><span>\u00A0 \u00A0 val isLoading: Boolean = false,</span></p>'
+          '<p>next paragraph with enough text to keep the fixture long.</p>'
+          '</body></html>';
+      const plainText =
+          'data class ScreenState(\n\n'
+          '    val isLoading: Boolean = false,\n\n'
+          'next paragraph with enough text to keep the fixture long.';
+
+      final json = EpubStructuredContentBuilder.buildFromHtml(html, plainText);
+      expect(json, isNotNull);
+      final parsed = StructuredContent.tryParse(json);
+      expect(parsed, isNotNull);
+
+      final block = parsed!.annotations.first;
+      final blockText = plainText.substring(block.start, block.end);
+      expect(blockText, startsWith('    val isLoading'));
+    });
   });
 
   group('EpubStructuredContentBuilder.build (v1.0 SectionExtraction API)', () {

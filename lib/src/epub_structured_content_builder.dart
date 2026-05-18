@@ -1030,6 +1030,73 @@ class EpubStructuredContentBuilder {
     return (s, e);
   }
 
+  /// Trim blank-line separators around a matched block without stripping
+  /// leading indentation on the content line itself. This is intentionally
+  /// narrower than [_trimRangeWhitespace]: a paragraph match may begin at the
+  /// block separator before an indented Google Docs code-like line, and that
+  /// indentation is semantic content.
+  static (int, int) _trimRangeBlockSeparators(
+    String plainText,
+    int start,
+    int end,
+  ) {
+    var s = start;
+    var e = end;
+
+    while (s < e) {
+      var cursor = s;
+      while (cursor < e && _isHorizontalAsciiWhitespace(plainText, cursor)) {
+        cursor++;
+      }
+      if (cursor < e && _isAsciiNewline(plainText, cursor)) {
+        s = cursor + 1;
+        continue;
+      }
+      break;
+    }
+
+    while (e > s) {
+      var cursor = e;
+      while (cursor > s &&
+          _isHorizontalAsciiWhitespace(plainText, cursor - 1)) {
+        cursor--;
+      }
+      if (cursor > s && _isAsciiNewline(plainText, cursor - 1)) {
+        e = cursor - 1;
+        continue;
+      }
+      break;
+    }
+
+    while (e > s && _isHorizontalAsciiWhitespace(plainText, e - 1)) {
+      e--;
+    }
+    return (s, e);
+  }
+
+  static bool _isHorizontalAsciiWhitespace(String text, int index) {
+    final c = text.codeUnitAt(index);
+    return c == 0x20 || c == 0x09;
+  }
+
+  static bool _isAsciiNewline(String text, int index) {
+    final c = text.codeUnitAt(index);
+    return c == 0x0A || c == 0x0D;
+  }
+
+  static int _expandToLineIndentation(String plainText, int idx, int minStart) {
+    var expanded = idx;
+    while (expanded > minStart &&
+        _isHorizontalAsciiWhitespace(plainText, expanded - 1)) {
+      expanded--;
+    }
+    if (expanded == idx) return idx;
+    if (expanded == 0 || _isAsciiNewline(plainText, expanded - 1)) {
+      return expanded;
+    }
+    return idx;
+  }
+
   /// Count `<li>` ancestors of [li] in its DOM tree. The emitting `<li>` is
   /// not counted, so a top-level `<li>` returns 0, the first nested `<li>`
   /// returns 1, etc.
@@ -1279,6 +1346,7 @@ class EpubStructuredContentBuilder {
         : normalized;
     var idx = _fuzzyIndexOf(plainText, searchKey, searchFrom);
     if (idx < 0) return null;
+    idx = _expandToLineIndentation(plainText, idx, searchFrom);
 
     final (matchLength, completeMatch) = _findMatchLengthWithCompleteness(
       plainText,
@@ -1310,7 +1378,7 @@ class EpubStructuredContentBuilder {
     }
 
     endIdx = endIdx.clamp(idx + 1, plainText.length);
-    final (trimmedStart, trimmedEnd) = _trimRangeWhitespace(
+    final (trimmedStart, trimmedEnd) = _trimRangeBlockSeparators(
       plainText,
       idx,
       endIdx,

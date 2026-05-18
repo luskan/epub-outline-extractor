@@ -740,7 +740,7 @@ String cleanExtractedText(String text) {
   result = result.replaceAll(RegExp(r'\n{3,}'), '\n\n');
   result = result.replaceAll(RegExp(r'[ \t]{2,}'), ' ');
 
-  final lines = result.split('\n').map((line) => line.trim());
+  final lines = result.split('\n').map(_trimAsciiWhitespace);
 
   final cleanedLines = <String>[];
   var lastWasEmpty = false;
@@ -756,7 +756,33 @@ String cleanExtractedText(String text) {
     }
   }
 
-  return cleanedLines.join('\n').trim();
+  return _normaliseNonBreakingSpaces(
+    _trimAsciiWhitespace(cleanedLines.join('\n')),
+  );
+}
+
+String _trimAsciiWhitespace(String text) {
+  var start = 0;
+  var end = text.length;
+  while (start < end && _isAsciiWhitespace(text.codeUnitAt(start))) {
+    start++;
+  }
+  while (end > start && _isAsciiWhitespace(text.codeUnitAt(end - 1))) {
+    end--;
+  }
+  return text.substring(start, end);
+}
+
+bool _isAsciiWhitespace(int codeUnit) {
+  return codeUnit == 0x20 ||
+      codeUnit == 0x09 ||
+      codeUnit == 0x0A ||
+      codeUnit == 0x0D;
+}
+
+String _normaliseNonBreakingSpaces(String text) {
+  final normalised = text.replaceAll('\u00A0', ' ');
+  return normalised.trim().isEmpty ? '' : normalised;
 }
 
 /// Check if element is inside a note, tip, warning, or sidebar container.

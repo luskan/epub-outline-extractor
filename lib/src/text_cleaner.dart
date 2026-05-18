@@ -60,16 +60,23 @@ class TextCleaner {
     // Pass 5: collapse [ \t]+ -> single space.
     current = current.replaceAll(RegExp(r"[ \t]+"), " ");
 
-    // Pass 6: per-line trim.
-    current = current.split("\n").map((line) => line.trim()).join("\n");
+    // Pass 6: per-line ASCII trim. Google Docs EPUB uses non-breaking
+    // spaces for manual indentation in code-like paragraphs; do not treat
+    // those as disposable edge whitespace.
+    current = current.split("\n").map(_trimAsciiWhitespace).join("\n");
 
     // Pass 7: collapse 3+ newlines into 2.
     current = current.replaceAll(RegExp(r"\n{3,}"), "\n\n");
 
-    // Pass 8: final trim of full output.
+    // Pass 8: final ASCII trim of full output.
     if (trimEdges) {
-      current = current.trim();
+      current = _trimAsciiWhitespace(current);
     }
+
+    // Pass 9: normalise NBSP to regular spaces after trimming, so semantic
+    // indentation survives as copyable plain text instead of being removed by
+    // the trim passes above.
+    current = _normaliseNonBreakingSpaces(current);
 
     // Derive a coarse 3-edit EditScript via prefix/suffix diff. Sufficient
     // for offset translation in our use case -- preserved ranges survive
@@ -90,10 +97,7 @@ class TextCleaner {
       // Hot path: no preserved ranges — equivalent to legacy cleaner with
       // an identity remap of any element ranges (cleaned through script).
       final result = cleanTextWithScript(input.text);
-      return RangeAwareResult(
-        cleanedText: result.text,
-        script: result.script,
-      );
+      return RangeAwareResult(cleanedText: result.text, script: result.script);
     }
 
     // Split into segments alternating outside/preserved, cleaner per-segment.
@@ -146,7 +150,10 @@ class TextCleaner {
       }
 
       // (b) Emit preserved segment verbatim, with tab→4-space normalisation.
-      final preservedText = input.text.substring(preserved.start, preserved.end);
+      final preservedText = input.text.substring(
+        preserved.start,
+        preserved.end,
+      );
       final normalised = _normalisePreservedText(preservedText);
       // For preserved content, the normalisation may change length (tab → 4
       // spaces) so we emit it as a single Replace edit to capture that, OR
@@ -271,9 +278,7 @@ class TextCleaner {
     if (a == b) {
       final edits = a.isEmpty
           ? const <Edit>[]
-          : <Edit>[
-              Keep(inputStart: 0, inputEnd: a.length, outputStart: 0),
-            ];
+          : <Edit>[Keep(inputStart: 0, inputEnd: a.length, outputStart: 0)];
       return EditScript(
         edits: edits,
         originalLength: a.length,
@@ -456,11 +461,7 @@ class TextCleaner {
     }
     if (suffixA < a.length) {
       edits.add(
-        Keep(
-          inputStart: suffixA,
-          inputEnd: a.length,
-          outputStart: outCursor,
-        ),
+        Keep(inputStart: suffixA, inputEnd: a.length, outputStart: outCursor),
       );
       outCursor += a.length - suffixA;
     }
@@ -477,21 +478,21 @@ class TextCleaner {
   static Edit _shiftEdit(Edit e, int inputDelta, int outputDelta) {
     return switch (e) {
       Keep() => Keep(
-          inputStart: e.inputStart + inputDelta,
-          inputEnd: e.inputEnd + inputDelta,
-          outputStart: e.outputStart + outputDelta,
-        ),
+        inputStart: e.inputStart + inputDelta,
+        inputEnd: e.inputEnd + inputDelta,
+        outputStart: e.outputStart + outputDelta,
+      ),
       Replace() => Replace(
-          inputStart: e.inputStart + inputDelta,
-          inputEnd: e.inputEnd + inputDelta,
-          outputStart: e.outputStart + outputDelta,
-          replacement: e.replacement,
-        ),
+        inputStart: e.inputStart + inputDelta,
+        inputEnd: e.inputEnd + inputDelta,
+        outputStart: e.outputStart + outputDelta,
+        replacement: e.replacement,
+      ),
       Delete() => Delete(
-          inputStart: e.inputStart + inputDelta,
-          inputEnd: e.inputEnd + inputDelta,
-          outputStart: e.outputStart + outputDelta,
-        ),
+        inputStart: e.inputStart + inputDelta,
+        inputEnd: e.inputEnd + inputDelta,
+        outputStart: e.outputStart + outputDelta,
+      ),
     };
   }
 
@@ -572,13 +573,37 @@ class TextCleaner {
 
   /// Normalize whitespace in text.
   static String normalizeWhitespace(String text) {
-    return text
+    final normalized = text
         .replaceAll(RegExp(r'[ \t]+'), ' ')
         .split('\n')
-        .map((line) => line.trim())
+        .map(_trimAsciiWhitespace)
         .join('\n')
-        .replaceAll(RegExp(r'\n{3,}'), '\n\n')
-        .trim();
+        .replaceAll(RegExp(r'\n{3,}'), '\n\n');
+    return _normaliseNonBreakingSpaces(_trimAsciiWhitespace(normalized));
+  }
+
+  static String _trimAsciiWhitespace(String text) {
+    var start = 0;
+    var end = text.length;
+    while (start < end && _isAsciiWhitespace(text.codeUnitAt(start))) {
+      start++;
+    }
+    while (end > start && _isAsciiWhitespace(text.codeUnitAt(end - 1))) {
+      end--;
+    }
+    return text.substring(start, end);
+  }
+
+  static bool _isAsciiWhitespace(int codeUnit) {
+    return codeUnit == 0x20 ||
+        codeUnit == 0x09 ||
+        codeUnit == 0x0A ||
+        codeUnit == 0x0D;
+  }
+
+  static String _normaliseNonBreakingSpaces(String text) {
+    final normalised = text.replaceAll('\u00A0', ' ');
+    return normalised.trim().isEmpty ? '' : normalised;
   }
 
   static const Map<String, String> _puaMapping = {

@@ -6,51 +6,65 @@ import 'package:html/parser.dart' as html_parser;
 import 'package:test/test.dart';
 
 void main() {
-  group('TextCleaner.cleanText (legacy) — byte-equality with cleanTextWithScript', () {
-    // §7.2: this corpus locks the legacy cleaner's output. The
-    // cleanTextWithScript path must produce the same output as the legacy
-    // cleanText for every input here.
-    final corpus = <String>[
-      // Existing fixtures from html_text_extractor_test.dart equivalents.
-      '   leading spaces',
-      'trailing spaces   ',
-      'mixed   spaces   here',
-      // cpp20-style slices.
-      'class Value {\n  long id;\n  int n;\n};',
-      '<pre>void foo() { return 0; }</pre>',
-      '\nfunction one()\n\n\nfunction two()\n',
-      // DDIA-style slices.
-      'a paragraph that wraps\nover several\nlines\n\nnext paragraph',
-      'sequence of words separated  by  multiple  spaces',
-      'tab\tcharacters\there',
-      'data\tin\ta\ttable',
-      // Edge cases.
-      '',
-      ' ',
-      '\n',
-      '\t',
-      // PUA character (U+E000 → mapped to nothing after unmapped strip).
-      'beforeafter',
-      // Round-3 additions.
-      '﻿leading BOM',
-      'CRLF\r\nendings\r\nhere',
-      'rust 🦀 emoji',
-      // Adversarial whitespace patterns.
-      '   ',
-      '\n\n\n\n',
-      '\n \n \n',
-      'a\n  \n  \nb',
-    ];
+  group(
+    'TextCleaner.cleanText (legacy) — byte-equality with cleanTextWithScript',
+    () {
+      // §7.2: this corpus locks the legacy cleaner's output. The
+      // cleanTextWithScript path must produce the same output as the legacy
+      // cleanText for every input here.
+      final corpus = <String>[
+        // Existing fixtures from html_text_extractor_test.dart equivalents.
+        '   leading spaces',
+        'trailing spaces   ',
+        'mixed   spaces   here',
+        // cpp20-style slices.
+        'class Value {\n  long id;\n  int n;\n};',
+        '<pre>void foo() { return 0; }</pre>',
+        '\nfunction one()\n\n\nfunction two()\n',
+        // DDIA-style slices.
+        'a paragraph that wraps\nover several\nlines\n\nnext paragraph',
+        'sequence of words separated  by  multiple  spaces',
+        'tab\tcharacters\there',
+        'data\tin\ta\ttable',
+        // Edge cases.
+        '',
+        ' ',
+        '\n',
+        '\t',
+        // PUA character (U+E000 → mapped to nothing after unmapped strip).
+        'beforeafter',
+        // Round-3 additions.
+        '﻿leading BOM',
+        'CRLF\r\nendings\r\nhere',
+        'rust 🦀 emoji',
+        // Adversarial whitespace patterns.
+        '   ',
+        '\n\n\n\n',
+        '\n \n \n',
+        'a\n  \n  \nb',
+      ];
 
-    for (final input in corpus) {
-      test('parity for ${_escape(input)}', () {
-        final legacy = TextCleaner.cleanText(input);
-        final viaScript =
-            TextCleaner.cleanTextWithScript(input).text;
-        expect(viaScript, legacy);
+      for (final input in corpus) {
+        test('parity for ${_escape(input)}', () {
+          final legacy = TextCleaner.cleanText(input);
+          final viaScript = TextCleaner.cleanTextWithScript(input).text;
+          expect(viaScript, legacy);
+        });
+      }
+
+      test('Google Docs NBSP indentation survives as regular spaces', () {
+        const input =
+            'data class ScreenState(\n'
+            '\u00A0 \u00A0 val isLoading: Boolean = false,\n'
+            ')';
+
+        final result = TextCleaner.cleanText(input);
+
+        expect(result, contains('\n    val isLoading: Boolean = false,'));
+        expect(result, isNot(contains('\u00A0')));
       });
-    }
-  });
+    },
+  );
 
   group('EditScript mapStart/mapEnd semantics (§5.4)', () {
     test('Replace([0,3), " ") on "   "', () {
@@ -105,16 +119,12 @@ void main() {
   group('cleanTextRespectingRanges — preserves <pre> content verbatim', () {
     final document = html_parser.parse('<html><body></body></html>');
 
-    ExtractedText make(
-      String text,
-      List<TextRange> preserved,
-    ) =>
-        ExtractedText(
-          text: text,
-          preservedRanges: preserved,
-          elementRanges: const {},
-          document: document,
-        );
+    ExtractedText make(String text, List<TextRange> preserved) => ExtractedText(
+      text: text,
+      preservedRanges: preserved,
+      elementRanges: const {},
+      document: document,
+    );
 
     test('no preserved ranges: byte-equal to legacy cleanText', () {
       const input = 'a   b   c';
@@ -177,13 +187,12 @@ void main() {
       String text,
       List<TextRange> preserved,
       Map<dom.Element, List<TextRange>> elements,
-    ) =>
-        ExtractedText(
-          text: text,
-          preservedRanges: preserved,
-          elementRanges: elements,
-          document: document,
-        );
+    ) => ExtractedText(
+      text: text,
+      preservedRanges: preserved,
+      elementRanges: elements,
+      document: document,
+    );
 
     test('200 random triples + 8 boundary cases', () {
       final rng = Random(0xC0FFEE);
@@ -261,11 +270,10 @@ void main() {
 
     test('boundary: two adjacent preserved ranges (zero outside between)', () {
       final out = TextCleaner.cleanTextRespectingRanges(
-        make(
-          '[A][B]',
-          [const TextRange(0, 3), const TextRange(3, 6)],
-          const {},
-        ),
+        make('[A][B]', [
+          const TextRange(0, 3),
+          const TextRange(3, 6),
+        ], const {}),
       );
       expect(out.cleanedText, '[A][B]');
     });
@@ -288,11 +296,7 @@ void main() {
 
     test('boundary: preserved over PUA-only content', () {
       final out = TextCleaner.cleanTextRespectingRanges(
-        make(
-          'beforeafter',
-          [const TextRange(6, 9)],
-          const {},
-        ),
+        make('beforeafter', [const TextRange(6, 9)], const {}),
       );
       // Preserved PUA survives; outside-preserved PUA should be stripped.
       expect(out.cleanedText.contains(''), isTrue);
