@@ -15,6 +15,7 @@ export 'src/epub_extraction_result.dart';
 export 'src/epub_extractor.dart';
 export 'src/epub_guards.dart';
 export 'src/epub_image_extractor.dart';
+export 'src/epub_section_split_options.dart';
 export 'src/epub_serializer.dart';
 export 'src/epub_structured_content_builder.dart';
 export 'src/extracted_text.dart';

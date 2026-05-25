@@ -96,6 +96,71 @@ void main() {
       expect(partB.subsections.single.content.single, contains('B1 body.'));
     });
 
+    test('optionally deepens TOC leaves with eligible HTML headings', () async {
+      final epubBytes = _createTocLeafWithHtmlHeadingsEpub();
+
+      final defaultResult = await EpubExtractor().extract(epubBytes);
+      final defaultSection = defaultResult.root.subsections.single.subsections
+          .firstWhere((section) => section.title == '4.1. Waiting');
+      expect(defaultSection.subsections, isEmpty);
+      expect(defaultSection.content.single, contains('Alpha body.'));
+
+      final h4Result = await EpubExtractor().extract(
+        epubBytes,
+        sectionSplitOptions: const EpubSectionSplitOptions(
+          maxHtmlHeadingLevel: 4,
+        ),
+      );
+      final h4Section = h4Result.root.subsections.single.subsections.firstWhere(
+        (section) => section.title == '4.1. Waiting',
+      );
+      expect(h4Section.subsections.map((section) => section.title), [
+        '4.1.1. Alpha condition',
+        '4.1.2. Beta condition',
+      ]);
+      expect(h4Section.content.single, isNot(contains('Alpha body.')));
+
+      final h5Result = await EpubExtractor().extract(
+        epubBytes,
+        sectionSplitOptions: const EpubSectionSplitOptions(
+          maxHtmlHeadingLevel: 5,
+        ),
+      );
+      final alpha = h5Result.root.subsections.single.subsections
+          .firstWhere((section) => section.title == '4.1. Waiting')
+          .subsections
+          .first;
+      expect(alpha.subsections.map((section) => section.title), [
+        'Passing tasks between threads',
+      ]);
+      expect(
+        alpha.subsections.map((section) => section.title),
+        isNot(contains('Listing 4.1. Example listing')),
+      );
+    });
+
+    test('analyzes available HTML heading split choices', () async {
+      final analysis = await EpubExtractor().analyzeSectionSplits(
+        _createTocLeafWithHtmlHeadingsEpub(),
+      );
+
+      expect(analysis.tocOnlySectionCount, 3);
+      expect(analysis.sectionCountFor(EpubSectionSplitOptions.tocOnly), 3);
+      expect(
+        analysis.sectionCountFor(
+          const EpubSectionSplitOptions(maxHtmlHeadingLevel: 4),
+        ),
+        5,
+      );
+      expect(
+        analysis.sectionCountFor(
+          const EpubSectionSplitOptions(maxHtmlHeadingLevel: 5),
+        ),
+        6,
+      );
+      expect(analysis.availableMaxHtmlHeadingLevels, containsAll([4, 5]));
+    });
+
     test('uses provided logger instance', () async {
       final logRecords = <String>[];
       final logger = Logger.detached('test-extractor');
@@ -295,6 +360,102 @@ Uint8List _createSameSpineAnchorsEpub() {
     <p>Part B intro.</p>
     <h2 id="h.secB">Section B1</h2>
     <p>B1 body.</p>
+  </body>
+</html>''';
+  archive.addFile(
+    ArchiveFile('OEBPS/chapter.xhtml', chapter.length, utf8.encode(chapter)),
+  );
+
+  final zipEncoder = ZipEncoder();
+  return Uint8List.fromList(zipEncoder.encode(archive));
+}
+
+Uint8List _createTocLeafWithHtmlHeadingsEpub() {
+  final archive = Archive();
+
+  archive.addFile(
+    ArchiveFile('mimetype', 20, utf8.encode('application/epub+zip')),
+  );
+
+  const containerXml = '''<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/package.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>''';
+  archive.addFile(
+    ArchiveFile(
+      'META-INF/container.xml',
+      containerXml.length,
+      utf8.encode(containerXml),
+    ),
+  );
+
+  const packageOpf = '''<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="uid" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="uid">toc-leaf-headings</dc:identifier>
+    <dc:language>en</dc:language>
+    <dc:title>TOC Leaf Headings</dc:title>
+  </metadata>
+  <manifest>
+    <item href="chapter.xhtml" id="chapter" media-type="application/xhtml+xml"/>
+    <item href="toc.ncx" id="ncx" media-type="application/x-dtbncx+xml"/>
+  </manifest>
+  <spine toc="ncx">
+    <itemref idref="chapter"/>
+  </spine>
+</package>''';
+  archive.addFile(
+    ArchiveFile(
+      'OEBPS/package.opf',
+      packageOpf.length,
+      utf8.encode(packageOpf),
+    ),
+  );
+
+  const tocNcx = '''<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <head>
+    <meta name="dtb:uid" content="toc-leaf-headings"/>
+  </head>
+  <docTitle><text>TOC Leaf Headings</text></docTitle>
+  <navMap>
+    <navPoint id="chapter" playOrder="1">
+      <navLabel><text>Chapter 4</text></navLabel>
+      <content src="chapter.xhtml"/>
+      <navPoint id="s1" playOrder="2">
+        <navLabel><text>4.1. Waiting</text></navLabel>
+        <content src="chapter.xhtml#ch04lev1sec1"/>
+      </navPoint>
+      <navPoint id="s2" playOrder="3">
+        <navLabel><text>4.2. Futures</text></navLabel>
+        <content src="chapter.xhtml#ch04lev1sec2"/>
+      </navPoint>
+    </navPoint>
+  </navMap>
+</ncx>''';
+  archive.addFile(
+    ArchiveFile('OEBPS/toc.ncx', tocNcx.length, utf8.encode(tocNcx)),
+  );
+
+  const chapter = '''<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><title>TOC Leaf Headings</title></head>
+  <body>
+    <h2 id="ch04">Chapter 4</h2>
+    <h3 id="ch04lev1sec1">4.1. Waiting</h3>
+    <p>4.1 intro.</p>
+    <h4 id="ch04lev2sec1">4.1.1. Alpha condition</h4>
+    <p>Alpha body.</p>
+    <h5 id="ch04lev3sec1">Passing tasks between threads</h5>
+    <p>Deep body.</p>
+    <h5 id="ch04ex01">Listing 4.1. Example listing</h5>
+    <pre>int ignored_as_section = 1;</pre>
+    <h4 id="ch04lev2sec2">4.1.2. Beta condition</h4>
+    <p>Beta body.</p>
+    <h3 id="ch04lev1sec2">4.2. Futures</h3>
+    <p>Future body.</p>
   </body>
 </html>''';
   archive.addFile(
