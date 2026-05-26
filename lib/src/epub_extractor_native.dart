@@ -1,0 +1,1199 @@
+/// Public EPUB extractor API.
+///
+/// Migrated from `quizpilgrim-app/.../core/converters/epub_converter.dart` in
+/// EPUB-plan Phase 2. Replaces mobile-private `AppLogger` with injected
+/// `package:logging` `Logger`. Returns a neutral [BookSection] tree (the
+/// TOC view) plus per-spine-file chapter content and OPF metadata; see
+/// `EpubExtractionResult` for why those last two pieces are bundled
+/// separately rather than folded into the [BookSection] tree.
+library;
+
+import 'dart:typed_data';
+
+import 'package:epub_pro/epub_pro.dart';
+import 'package:html/dom.dart' as dom;
+import 'package:html/parser.dart' as html_parser;
+import 'package:quizpilgrim_book_model/quizpilgrim_book_model.dart';
+
+import 'epub_data.dart';
+import 'epub_extraction_result.dart';
+import 'epub_guards.dart';
+import 'epub_section_split_options.dart';
+import 'epub_structured_content_builder.dart';
+import 'extracted_text.dart';
+import 'html_text_extractor.dart';
+import 'text_cleaner.dart';
+import 'text_parsing_utils.dart';
+
+const String _loggerName = 'EpubExtractor';
+
+class EpubExtractor {
+  final bool fixLineBreaks;
+  final bool extractSections;
+  final EpubSectionSplitOptions sectionSplitOptions;
+  final EpubGuardLimits guardLimits;
+  final Logger _logger;
+
+  EpubExtractor({
+    this.fixLineBreaks = true,
+    this.extractSections = true,
+    this.sectionSplitOptions = EpubSectionSplitOptions.tocOnly,
+    this.guardLimits = const EpubGuardLimits(),
+    Logger? logger,
+  }) : _logger = logger ?? Logger(_loggerName);
+
+  /// Convert EPUB bytes into an [EpubExtractionResult] (TOC tree +
+  /// per-spine chapter content + OPF metadata).
+  ///
+  /// [epubBytes] — Raw EPUB bytes.
+  /// [filename] — Original filename, surfaced in error messages and useful
+  ///   when the EPUB OPF lacks a title.
+  /// [onProgress] — Optional progress callback. Stage strings are
+  ///   `'Parsing EPUB'`, `'Extracting chapters'`, `'Extracting sections'`.
+  Future<EpubExtractionResult> extract(
+    Uint8List epubBytes, {
+    String? filename,
+    EpubSectionSplitOptions? sectionSplitOptions,
+    void Function(int current, int total, String stage)? onProgress,
+  }) async {
+    // Logs are emitted at FINE level so the legacy silent-by-default
+    // behavior is preserved when consumers don't explicitly raise the
+    // logger threshold (legacy `EpubToJsonConverter` defaulted
+    // `verbose: false`, making `_log()` a no-op in release builds).
+    _logger.fine('Converting EPUB: ${filename ?? "unknown"}');
+
+    enforceArchiveGuards(epubBytes, guardLimits);
+
+    onProgress?.call(0, 100, 'Parsing EPUB');
+    final epubBook = await EpubReader.readBook(epubBytes);
+    onProgress?.call(100, 100, 'Parsing EPUB');
+    _logger.fine('Parsed EPUB: "${epubBook.title}"');
+
+    final epubData = _buildEpubDataFromEpubPro(epubBook);
+
+    final chapters = _extractChapters(
+      epubBook,
+      onProgress: (current, total) =>
+          onProgress?.call(current, total, 'Extracting chapters'),
+    );
+    _logger.fine('Extracted ${chapters.length} chapters');
+
+    final effectiveSplitOptions =
+        sectionSplitOptions ?? this.sectionSplitOptions;
+    final tocSections = (extractSections && epubData.tocEntries.isNotEmpty)
+        ? _buildTocSections(
+            epubBook,
+            epubData,
+            chapters,
+            sectionSplitOptions: effectiveSplitOptions,
+            onProgress: (current, total) =>
+                onProgress?.call(current, total, 'Extracting sections'),
+          )
+        : <BookSection>[];
+
+    final root = BookSection(
+      title: epubBook.title ?? '',
+      location: const EpubChapterLocation(spineIndex: 0),
+      subsections: tocSections,
+    );
+
+    final chapterContents = <EpubChapterContent>[
+      for (var i = 0; i < chapters.length; i++)
+        EpubChapterContent(
+          spineIndex: i,
+          filename: chapters[i].name,
+          title: chapters[i].title,
+          text: chapters[i].text,
+        ),
+    ];
+
+    final metadata = EpubBookMetadata(
+      title: epubBook.title,
+      author: epubBook.author,
+      authors: List<String?>.unmodifiable(epubBook.authors),
+    );
+
+    _logger.fine(
+      'EPUB extraction complete — chapters=${chapters.length}, '
+      'sections=${_countTree(tocSections)}',
+    );
+
+    // Capture raw HTML/XHTML by OPF-relative href so downstream
+    // consumers (e.g. book_tools' chapter preview panel) can render the
+    // original markup without re-parsing the archive. Empty when
+    // `epub_pro` returns no html-classified files.
+    final htmlMap = <String, String>{};
+    for (final entry in (epubBook.content?.html ?? const {}).entries) {
+      final raw = entry.value.content;
+      if (raw != null) htmlMap[entry.key] = raw;
+    }
+
+    return EpubExtractionResult(
+      root: root,
+      chapters: chapterContents,
+      metadata: metadata,
+      rawHtmlByHref: Map.unmodifiable(htmlMap),
+    );
+  }
+
+  /// Pre-import analysis that lets callers present available split-depth
+  /// choices without changing the extracted book.
+  Future<EpubSectionSplitAnalysis> analyzeSectionSplits(
+    Uint8List epubBytes, {
+    String? filename,
+  }) async {
+    enforceArchiveGuards(epubBytes, guardLimits);
+    final epubBook = await EpubReader.readBook(epubBytes);
+    final epubData = _buildEpubDataFromEpubPro(epubBook);
+    final htmlContentMap = _collectHtmlContentMap(epubBook);
+    return _analyzeSectionSplits(epubData.tocEntries, htmlContentMap);
+  }
+
+  /// Build internal EpubData from epub_pro structures.
+  EpubData _buildEpubDataFromEpubPro(EpubBook epubBook) {
+    final metadata = <String, String>{};
+    if (epubBook.title != null) metadata['title'] = epubBook.title!;
+    if (epubBook.author != null) metadata['creator'] = epubBook.author!;
+    final authors = epubBook.authors;
+    for (var i = 0; i < authors.length; i++) {
+      final author = authors[i];
+      if (author != null) {
+        metadata['author_$i'] = author;
+      }
+    }
+
+    final spineOrder = <String>[];
+    void collectSpineOrder(EpubChapter chapter) {
+      if (chapter.contentFileName != null &&
+          !spineOrder.contains(chapter.contentFileName)) {
+        spineOrder.add(chapter.contentFileName!);
+      }
+      for (final sub in chapter.subChapters) {
+        collectSpineOrder(sub);
+      }
+    }
+
+    for (final chapter in epubBook.chapters) {
+      collectSpineOrder(chapter);
+    }
+
+    final navigationPoints = epubBook.schema?.navigation?.navMap?.points;
+    final tocEntries = navigationPoints != null && navigationPoints.isNotEmpty
+        ? _buildTocFromNavigationPoints(navigationPoints, null, 0)
+        : _buildTocFromChapters(epubBook.chapters, null, 0);
+
+    return EpubData(
+      metadata: metadata,
+      spineOrder: spineOrder,
+      tocEntries: tocEntries,
+      opfDir: '',
+    );
+  }
+
+  /// Build TocEntry tree from the raw EPUB NAV/NCX map.
+  ///
+  /// `epub_pro` reconciles chapters by spine position after parsing the NAV.
+  /// Google Docs EPUBs commonly put every TOC anchor in one XHTML spine file;
+  /// when chapter reconciliation keys by spine position, same-file top-level
+  /// anchors overwrite each other. The schema navigation map still contains
+  /// the full TOC, so section extraction must build from it directly.
+  List<TocEntry> _buildTocFromNavigationPoints(
+    List<EpubNavigationPoint> points,
+    String? parentTitle,
+    int depth,
+  ) {
+    final entries = <TocEntry>[];
+
+    for (final point in points) {
+      final childEntries = point.childNavigationPoints.isNotEmpty
+          ? _buildTocFromNavigationPoints(
+              point.childNavigationPoints,
+              _navigationPointTitle(point),
+              depth + 1,
+            )
+          : <TocEntry>[];
+
+      var title = _navigationPointTitle(point);
+      if (point.childNavigationPoints.isNotEmpty &&
+          point.childNavigationPoints.first.navigationLabels.isNotEmpty) {
+        final firstChildTitle = _navigationPointTitle(
+          point.childNavigationPoints.first,
+        );
+        final strippedChildTitle = TextParsingUtils.stripPartPrefix(
+          firstChildTitle,
+        ).trim();
+        if (strippedChildTitle.toLowerCase() == title.toLowerCase()) {
+          title = firstChildTitle;
+        }
+      }
+
+      entries.add(
+        TocEntry(
+          title: title,
+          href: _normalizeNavigationHref(point.content?.source),
+          parentTitle: parentTitle,
+          depth: depth,
+          children: childEntries,
+        ),
+      );
+    }
+
+    return entries;
+  }
+
+  String _navigationPointTitle(EpubNavigationPoint point) {
+    for (final label in point.navigationLabels) {
+      final text = label.text?.trim();
+      if (text != null && text.isNotEmpty) return text;
+    }
+    return 'Untitled';
+  }
+
+  String? _normalizeNavigationHref(String? href) {
+    final value = href?.trim();
+    if (value == null || value.isEmpty) return null;
+
+    final hashIndex = value.indexOf('#');
+    if (hashIndex < 0) return _decodeHrefPath(value);
+
+    final path = value.substring(0, hashIndex);
+    final fragment = value.substring(hashIndex + 1);
+    return '${_decodeHrefPath(path)}#$fragment';
+  }
+
+  String _decodeHrefPath(String value) {
+    try {
+      return Uri.decodeFull(value);
+    } catch (_) {
+      return value;
+    }
+  }
+
+  /// Build TocEntry tree from epub_pro chapters.
+  List<TocEntry> _buildTocFromChapters(
+    List<EpubChapter> chapters,
+    String? parentTitle,
+    int depth,
+  ) {
+    final entries = <TocEntry>[];
+
+    for (final chapter in chapters) {
+      String? href;
+      if (chapter.contentFileName != null) {
+        href = chapter.anchor != null
+            ? '${chapter.contentFileName}#${chapter.anchor}'
+            : chapter.contentFileName;
+      }
+
+      final childEntries = chapter.subChapters.isNotEmpty
+          ? _buildTocFromChapters(chapter.subChapters, chapter.title, depth + 1)
+          : <TocEntry>[];
+
+      // If parent has a generic title and first child has numbered version,
+      // use the child's title for parent (e.g., "Data Structures" → "I. Data Structures")
+      String title = chapter.title?.trim() ?? 'Untitled';
+      if (chapter.subChapters.isNotEmpty) {
+        final firstChildTitle = chapter.subChapters.first.title?.trim();
+        if (firstChildTitle != null && firstChildTitle.isNotEmpty) {
+          final strippedChildTitle = TextParsingUtils.stripPartPrefix(
+            firstChildTitle,
+          ).trim();
+          if (strippedChildTitle.toLowerCase() == title.toLowerCase()) {
+            title = firstChildTitle;
+          }
+        }
+      }
+
+      entries.add(
+        TocEntry(
+          title: title,
+          href: href,
+          parentTitle: parentTitle,
+          depth: depth,
+          children: childEntries,
+        ),
+      );
+    }
+
+    return entries;
+  }
+
+  /// Extract chapters from epub_pro book — one [ChapterData] per HTML file.
+  List<ChapterData> _extractChapters(
+    EpubBook epubBook, {
+    void Function(int current, int total)? onProgress,
+  }) {
+    final chapters = <ChapterData>[];
+    final seenFiles = <String>{};
+    final totalChapters = _countChapters(epubBook.chapters);
+    var processed = 0;
+
+    if (totalChapters > 0) {
+      onProgress?.call(0, totalChapters);
+    }
+
+    void processChapter(EpubChapter chapter) {
+      processed++;
+      onProgress?.call(processed, totalChapters);
+
+      // Decide whether the current node contributes a [ChapterData].
+      // Recursion into subChapters runs unconditionally afterward — a
+      // skipped parent (e.g., a part-divider navPoint with no content,
+      // duplicate file, or empty body) must not silently drop its
+      // descendants, otherwise the TOC pass later sees `chapterIndex ==
+      // -1` for those descendants and fails to materialise them as
+      // depth-1 BookSections (Round 1/2 review feedback).
+      final fileName = chapter.contentFileName;
+      final hasFile = fileName != null && !seenFiles.contains(fileName);
+      final isHtml = hasFile && _isHtmlFile(fileName);
+      final htmlContent = isHtml ? chapter.htmlContent : null;
+      final hasContent = htmlContent != null && htmlContent.isNotEmpty;
+
+      if (hasFile && isHtml && hasContent) {
+        final text = extractTextFromHtml(htmlContent);
+        if (text.trim().isNotEmpty) {
+          seenFiles.add(fileName);
+          final cleanedText = fixLineBreaks
+              ? TextCleaner.cleanText(text, fixLineBreaks: true)
+              : text;
+          final title =
+              chapter.title ?? extractTitleFromHtml(htmlContent, fileName);
+          chapters.add(
+            ChapterData(
+              chapter: chapters.length + 1,
+              name: fileName,
+              title: title,
+              text: cleanedText,
+              confidence: 1.0,
+              correctedText: cleanedText,
+            ),
+          );
+        }
+      }
+
+      for (final sub in chapter.subChapters) {
+        processChapter(sub);
+      }
+    }
+
+    for (final chapter in epubBook.chapters) {
+      processChapter(chapter);
+    }
+
+    return chapters;
+  }
+
+  Map<String, String> _collectHtmlContentMap(EpubBook epubBook) {
+    final htmlContentMap = <String, String>{};
+
+    void collectHtml(EpubChapter chapter) {
+      if (chapter.contentFileName != null && chapter.htmlContent != null) {
+        htmlContentMap[chapter.contentFileName!] = chapter.htmlContent!;
+      }
+      for (final sub in chapter.subChapters) {
+        collectHtml(sub);
+      }
+    }
+
+    for (final chapter in epubBook.chapters) {
+      collectHtml(chapter);
+    }
+    return htmlContentMap;
+  }
+
+  EpubSectionSplitAnalysis _analyzeSectionSplits(
+    List<TocEntry> tocEntries,
+    Map<String, String> htmlContentMap,
+  ) {
+    final tocOnlyCount = _countTocEntries(tocEntries);
+    final sectionCountByLevel = <int, int>{};
+    var previousCount = tocOnlyCount;
+    final candidateCountByLevel = <int, int>{};
+
+    for (var level = 1; level <= 6; level++) {
+      final augmented = _augmentTocWithHtmlHeadings(
+        tocEntries,
+        htmlContentMap,
+        EpubSectionSplitOptions(maxHtmlHeadingLevel: level),
+      );
+      final count = _countTocEntries(augmented);
+      sectionCountByLevel[level] = count;
+      if (count > previousCount) {
+        candidateCountByLevel[level] = count - previousCount;
+      }
+      previousCount = count;
+    }
+
+    return EpubSectionSplitAnalysis(
+      tocOnlySectionCount: tocOnlyCount,
+      sectionCountByMaxHtmlHeadingLevel: Map.unmodifiable(sectionCountByLevel),
+      candidateHeadingCountByLevel: Map.unmodifiable(candidateCountByLevel),
+    );
+  }
+
+  List<TocEntry> _augmentTocWithHtmlHeadings(
+    List<TocEntry> tocEntries,
+    Map<String, String> htmlContentMap,
+    EpubSectionSplitOptions options,
+  ) {
+    final maxLevel = options.maxHtmlHeadingLevel;
+    if (maxLevel == null) return tocEntries;
+
+    final originalFlat = _flattenToc(tocEntries);
+    final existingHrefs = {
+      for (final item in originalFlat)
+        if (item.href != null) item.href!,
+    };
+    final htmlIndexes = {
+      for (final entry in htmlContentMap.entries)
+        entry.key: _buildHtmlHeadingIndex(
+          entry.key,
+          entry.value,
+          existingHrefs,
+        ),
+    };
+    final rangesByHref = _buildOriginalTocRanges(originalFlat, htmlIndexes);
+
+    TocEntry augment(TocEntry entry, String? parentTitle) {
+      final children = [
+        for (final child in entry.children) augment(child, entry.title),
+      ];
+
+      // Only deepen authored TOC leaves. If the EPUB already supplied
+      // children, keep that authorial structure as the source of truth.
+      if (children.isNotEmpty || entry.href == null) {
+        return TocEntry(
+          title: entry.title,
+          href: entry.href,
+          parentTitle: parentTitle,
+          depth: entry.depth,
+          children: children,
+        );
+      }
+
+      final range = rangesByHref[entry.href!];
+      final index = range == null ? null : htmlIndexes[range.file];
+      if (range == null || index == null) {
+        return TocEntry(
+          title: entry.title,
+          href: entry.href,
+          parentTitle: parentTitle,
+          depth: entry.depth,
+        );
+      }
+
+      final candidates = index.candidates
+          .where(
+            (candidate) =>
+                candidate.order > range.startOrder &&
+                candidate.order < range.endOrder &&
+                candidate.level > range.parentHeadingLevel &&
+                candidate.level <= maxLevel &&
+                _normalizeTitle(candidate.title) !=
+                    _normalizeTitle(entry.title),
+          )
+          .toList();
+      if (candidates.isEmpty) {
+        return TocEntry(
+          title: entry.title,
+          href: entry.href,
+          parentTitle: parentTitle,
+          depth: entry.depth,
+        );
+      }
+
+      var candidateIndex = 0;
+      List<TocEntry> buildChildren(
+        int parentHeadingLevel,
+        String? childParentTitle,
+        int depth,
+      ) {
+        final result = <TocEntry>[];
+        while (candidateIndex < candidates.length) {
+          final candidate = candidates[candidateIndex];
+          if (candidate.level <= parentHeadingLevel) break;
+          candidateIndex++;
+          final childChildren = buildChildren(
+            candidate.level,
+            candidate.title,
+            depth + 1,
+          );
+          result.add(
+            TocEntry(
+              title: candidate.title,
+              href: '${candidate.file}#${candidate.fragment}',
+              parentTitle: childParentTitle,
+              depth: depth,
+              children: childChildren,
+            ),
+          );
+        }
+        return result;
+      }
+
+      return TocEntry(
+        title: entry.title,
+        href: entry.href,
+        parentTitle: parentTitle,
+        depth: entry.depth,
+        children: buildChildren(
+          range.parentHeadingLevel,
+          entry.title,
+          entry.depth + 1,
+        ),
+      );
+    }
+
+    return [for (final entry in tocEntries) augment(entry, null)];
+  }
+
+  Map<String, _OriginalTocRange> _buildOriginalTocRanges(
+    List<TocItemFlat> originalFlat,
+    Map<String, _HtmlHeadingIndex> htmlIndexes,
+  ) {
+    final ranges = <String, _OriginalTocRange>{};
+
+    for (var i = 0; i < originalFlat.length; i++) {
+      final item = originalFlat[i];
+      if (item.href == null || ranges.containsKey(item.href)) continue;
+
+      final (file, fragment) = TextParsingUtils.parseHref(item.href!);
+      final index = htmlIndexes[file];
+      if (index == null) continue;
+
+      final startOrder = fragment == null
+          ? -1
+          : index.headingOrderByFragment[fragment] ?? -1;
+      final parentHeadingLevel = fragment == null
+          ? 0
+          : index.headingLevelByFragment[fragment] ?? 0;
+
+      var endOrder = 1 << 30;
+      for (var j = i + 1; j < originalFlat.length; j++) {
+        final nextHref = originalFlat[j].href;
+        if (nextHref == null) continue;
+        final (nextFile, nextFragment) = TextParsingUtils.parseHref(nextHref);
+        if (nextFile != file) break;
+        if (nextFragment == null) continue;
+        final nextOrder = index.headingOrderByFragment[nextFragment];
+        if (nextOrder != null) {
+          endOrder = nextOrder;
+          break;
+        }
+      }
+
+      ranges[item.href!] = _OriginalTocRange(
+        file: file,
+        startOrder: startOrder,
+        endOrder: endOrder,
+        parentHeadingLevel: parentHeadingLevel,
+      );
+    }
+
+    return ranges;
+  }
+
+  _HtmlHeadingIndex _buildHtmlHeadingIndex(
+    String file,
+    String htmlContent,
+    Set<String> existingHrefs,
+  ) {
+    final document = html_parser.parse(htmlContent);
+    document.querySelectorAll('script, style').forEach((element) {
+      element.remove();
+    });
+    final body = document.body;
+    if (body == null) {
+      return const _HtmlHeadingIndex(
+        candidates: [],
+        headingOrderByFragment: {},
+        headingLevelByFragment: {},
+      );
+    }
+
+    final preorderIndex = <dom.Element, int>{};
+    var order = 0;
+    void visit(dom.Element element) {
+      preorderIndex[element] = order++;
+      for (final child in element.children) {
+        visit(child);
+      }
+    }
+
+    visit(body);
+
+    final candidates = <_HtmlHeadingCandidate>[];
+    final orderByFragment = <String, int>{};
+    final levelByFragment = <String, int>{};
+
+    for (final heading in body.querySelectorAll('h1, h2, h3, h4, h5, h6')) {
+      final level = getHeadingLevel(heading);
+      if (level == null) continue;
+      final headingOrder = preorderIndex[heading] ?? 0;
+      final fragments = _fragmentsForElement(heading);
+      for (final fragment in fragments) {
+        orderByFragment[fragment] = headingOrder;
+        levelByFragment[fragment] = level;
+      }
+
+      final fragment = _primaryFragmentForHeading(heading);
+      if (fragment == null) continue;
+      final href = '$file#$fragment';
+      if (existingHrefs.contains(href)) continue;
+
+      final title = TextParsingUtils.cleanWhitespace(heading.text);
+      if (title.isEmpty) continue;
+      final candidate = _HtmlHeadingCandidate(
+        file: file,
+        fragment: fragment,
+        title: title,
+        level: level,
+        order: headingOrder,
+      );
+      if (_isEligibleHtmlHeadingCandidate(candidate)) {
+        candidates.add(candidate);
+      }
+    }
+
+    candidates.sort((a, b) => a.order.compareTo(b.order));
+    return _HtmlHeadingIndex(
+      candidates: List.unmodifiable(candidates),
+      headingOrderByFragment: Map.unmodifiable(orderByFragment),
+      headingLevelByFragment: Map.unmodifiable(levelByFragment),
+    );
+  }
+
+  List<String> _fragmentsForElement(dom.Element element) {
+    final result = <String>[];
+    void collect(dom.Element current) {
+      final id = current.id.trim();
+      if (id.isNotEmpty) result.add(id);
+      final name = current.attributes['name']?.trim();
+      if (name != null && name.isNotEmpty) result.add(name);
+      for (final child in current.children) {
+        collect(child);
+      }
+    }
+
+    collect(element);
+    return result;
+  }
+
+  String? _primaryFragmentForHeading(dom.Element heading) {
+    final headingId = heading.id.trim();
+    if (headingId.isNotEmpty && !_isAuxiliaryTitleAnchor(headingId)) {
+      return headingId;
+    }
+    for (final fragment in _fragmentsForElement(heading)) {
+      if (!_isAuxiliaryTitleAnchor(fragment)) return fragment;
+    }
+    return null;
+  }
+
+  bool _isAuxiliaryTitleAnchor(String fragment) {
+    return fragment.endsWith('__title');
+  }
+
+  bool _isEligibleHtmlHeadingCandidate(_HtmlHeadingCandidate candidate) {
+    final id = candidate.fragment.toLowerCase();
+    final title = candidate.title.trim().toLowerCase();
+
+    if (RegExp(
+      r'(?:^|[._-])(ex|fig|figure|table|fn|footnote)\d*$',
+    ).hasMatch(id)) {
+      return false;
+    }
+    if (RegExp(r'^(listing|figure|fig\.|table|footnote)\b').hasMatch(title)) {
+      return false;
+    }
+
+    if (candidate.level <= 4) return true;
+    if (RegExp(r'lev\d+sec\d+').hasMatch(id)) return true;
+    if (RegExp(r'^\d+(?:\.\d+){2,}\.?\s+').hasMatch(candidate.title)) {
+      return true;
+    }
+    if (RegExp(r'^[A-Z]\.\d+(?:\.\d+)*\.?\s+').hasMatch(candidate.title)) {
+      return true;
+    }
+    return false;
+  }
+
+  /// Build the hierarchical TOC tree as `List<BookSection>`.
+  ///
+  /// Mirrors the original [TocEntry] tree at all depths. Older imports only
+  /// kept depth 0 and depth 1, but same-level Google Docs headings can be
+  /// nested in the NAV; dropping depth 2+ then loses content because the
+  /// section extractor stops at the next same-level heading.
+  ///
+  /// Each section's [BookSection.location] (an [EpubChapterLocation])
+  /// reflects the entry's own href — its `spineIndex` may differ from its
+  /// parent's if the depth-1 entry's href points to a different chapter
+  /// file (an unusual but legal EPUB structure).
+  List<BookSection> _buildTocSections(
+    EpubBook epubBook,
+    EpubData epubData,
+    List<ChapterData> chapters, {
+    EpubSectionSplitOptions sectionSplitOptions =
+        EpubSectionSplitOptions.tocOnly,
+    void Function(int current, int total)? onProgress,
+  }) {
+    final htmlContentMap = _collectHtmlContentMap(epubBook);
+
+    final tocEntries = sectionSplitOptions.usesHtmlHeadings
+        ? _augmentTocWithHtmlHeadings(
+            epubData.tocEntries,
+            htmlContentMap,
+            sectionSplitOptions,
+          )
+        : epubData.tocEntries;
+    final tocFlat = _flattenToc(tocEntries);
+    if (tocFlat.isNotEmpty) {
+      onProgress?.call(0, tocFlat.length);
+    }
+
+    // Build a flat parallel list of BookSections in tocFlat order, then
+    // reconstruct the full hierarchy. We need the flat ordering for
+    // next-fragment bound computation, but we emit a hierarchical tree so the
+    // adapter can recover legacy `parentTitle` semantics from immediate
+    // parent relationships.
+    //
+    // Virtual placeholders: entries with no href (or whose href points to a
+    // missing chapter) still get a [BookSection] when they have children. The
+    // mobile adapter recognises the sentinel location (`spineIndex: -1,
+    // href: null`) and skips emitting a SectionData for the placeholder
+    // itself, but still emits descendants with `parentTitle =
+    // placeholder.title`.
+    final flatBookSections = <BookSection?>[];
+    final documentTitleWrapperIndexes = <int>{};
+
+    BookSection virtualPlaceholder(String title) => BookSection(
+      title: title,
+      location: const EpubChapterLocation(spineIndex: -1),
+    );
+
+    for (var i = 0; i < tocFlat.length; i++) {
+      final tocItem = tocFlat[i];
+      onProgress?.call(i + 1, tocFlat.length);
+
+      if (tocItem.href == null) {
+        _logger.fine('SKIPPED: "${tocItem.title}" - no href');
+        flatBookSections.add(
+          tocItem.isSection ? virtualPlaceholder(tocItem.title) : null,
+        );
+        continue;
+      }
+
+      final (file, fragment) = TextParsingUtils.parseHref(tocItem.href!);
+
+      final chapterIndex = chapters.indexWhere((ch) => ch.name == file);
+      if (chapterIndex == -1) {
+        _logger.fine('SKIPPED: "${tocItem.title}" - chapter not found: $file');
+        flatBookSections.add(
+          tocItem.isSection ? virtualPlaceholder(tocItem.title) : null,
+        );
+        continue;
+      }
+
+      final isDocumentTitleWrapper = _isDocumentTitleWrapper(
+        tocItem,
+        documentTitle: epubBook.title,
+        fragment: fragment,
+      );
+      if (isDocumentTitleWrapper) {
+        _logger.fine('SKIPPED: "${tocItem.title}" - document-title wrapper');
+        documentTitleWrapperIndexes.add(i);
+      }
+
+      // Find next fragment in same file (if any) — used as bound.
+      String? nextFragment;
+      for (var j = i + 1; j < tocFlat.length; j++) {
+        final nextItem = tocFlat[j];
+        if (nextItem.href == null) continue;
+
+        final (nextFile, nextFrag) = TextParsingUtils.parseHref(nextItem.href!);
+        if (nextFile == file && nextFrag != null) {
+          nextFragment = nextFrag;
+          break;
+        } else if (nextFile != file) {
+          break;
+        }
+      }
+
+      // Extract section text. v1.0: route every chapter with HTML content
+      // through the structured pipeline so <pre> code blocks survive
+      // whitespace collapse and power preserveLineBreaks + monospace marks
+      // downstream — including spine-only chapters (no fragment, no
+      // following same-file fragment) which previously fell into the
+      // legacy `chapters[i].text` branch with structuredExtraction = null.
+      //
+      // For both-null fragments we use [extractStructured] (body-only
+      // walker) as the explicit production call form; Fix 5 also makes
+      // `extractSectionStructured(_, null, null)` body-only, but using
+      // [extractStructured] here makes intent obvious at the call site.
+      // The legacy `extractSectionText` / `chapters[i].text` paths are
+      // kept only as catch-handler fallbacks.
+      String sectionText;
+      SectionExtraction? structuredExtraction;
+      final htmlContent = htmlContentMap[file];
+      if (htmlContent != null) {
+        try {
+          final SectionExtraction raw;
+          if (fragment == null && nextFragment == null) {
+            raw = SectionExtraction(
+              extracted: extractStructured(htmlContent),
+              sectionStartElement: null,
+              sectionEndElement: null,
+            );
+          } else {
+            raw = extractSectionStructured(
+              htmlContent,
+              fragment,
+              nextFragment,
+              logger: _logger.fine,
+            );
+          }
+          final cleaned = TextCleaner.cleanExtractedTextRespectingRanges(
+            raw.extracted,
+          );
+          sectionText = cleaned.text;
+          structuredExtraction = SectionExtraction(
+            extracted: cleaned,
+            sectionStartElement: raw.sectionStartElement,
+            sectionEndElement: raw.sectionEndElement,
+          );
+        } catch (e, st) {
+          _logger.warning(
+            'v1.0 structured pipeline failed for "${tocItem.title}", '
+            'falling back to legacy extraction (expect coverage gaps and '
+            'limited inline marks): $e',
+            e,
+            st,
+          );
+          sectionText = (fragment != null || nextFragment != null)
+              ? extractSectionText(
+                  htmlContent,
+                  fragment,
+                  nextFragment,
+                  logger: _logger.fine,
+                )
+              : chapters[chapterIndex].text;
+          structuredExtraction = null;
+        }
+
+        if (sectionText.length > 50000) {
+          _logger.warning(
+            'Section "${tocItem.title}" has ${sectionText.length} chars '
+            '(possible boundary issue)',
+          );
+        } else if (sectionText.isEmpty) {
+          _logger.warning('Section "${tocItem.title}" is EMPTY');
+        }
+      } else {
+        sectionText = chapters[chapterIndex].text;
+      }
+
+      // Generate structured content annotations.
+      // - With a structuredExtraction (v1.0 path): uses elementRanges to
+      //   emit <pre> code blocks with preserveLineBreaks + monospace.
+      // - Without (no-fragment chapter text): falls back to the legacy
+      //   fuzzy-match buildFromHtml.
+      String? structuredJson;
+      final sectionHtml = htmlContentMap[file];
+      if (sectionText.isNotEmpty && sectionHtml != null) {
+        try {
+          if (structuredExtraction != null) {
+            structuredJson = EpubStructuredContentBuilder.build(
+              structuredExtraction,
+            );
+          } else {
+            structuredJson = EpubStructuredContentBuilder.buildFromHtml(
+              sectionHtml,
+              sectionText,
+            );
+          }
+        } catch (e) {
+          _logger.warning('Structured content extraction failed: $e');
+        }
+      }
+
+      flatBookSections.add(
+        BookSection(
+          title: tocItem.title,
+          location: EpubChapterLocation(
+            spineIndex: chapterIndex,
+            href: file,
+            anchor: fragment,
+          ),
+          content: [sectionText],
+          structuredContentJson: structuredJson,
+        ),
+      );
+    }
+
+    // Reconstruct the original hierarchy from the flat DFS list. Processing
+    // from the end lets every node attach its already-built child list to
+    // the nearest preceding shallower item.
+    final result = <BookSection>[];
+    final childBuckets = List<List<BookSection>>.generate(
+      tocFlat.length,
+      (_) => <BookSection>[],
+    );
+
+    for (var i = tocFlat.length - 1; i >= 0; i--) {
+      final children = childBuckets[i];
+      final section = flatBookSections[i];
+      final nodesToAttach = <BookSection>[];
+
+      if (documentTitleWrapperIndexes.contains(i)) {
+        final wrapper = section;
+        nodesToAttach.addAll(
+          wrapper == null
+              ? children
+              : _prependSectionContent(wrapper, children),
+        );
+      } else if (section != null) {
+        nodesToAttach.add(
+          children.isEmpty ? section : section.copyWith(subsections: children),
+        );
+      } else {
+        nodesToAttach.addAll(children);
+      }
+
+      if (nodesToAttach.isEmpty) continue;
+
+      final parentIndex = _findFlatParentIndex(tocFlat, i);
+      if (parentIndex == null) {
+        result.insertAll(0, nodesToAttach);
+      } else {
+        childBuckets[parentIndex].insertAll(0, nodesToAttach);
+      }
+    }
+
+    return result;
+  }
+
+  List<BookSection> _prependSectionContent(
+    BookSection prefix,
+    List<BookSection> sections,
+  ) {
+    final prefixText = prefix.content.isNotEmpty ? prefix.content.first : '';
+    if (prefixText.trim().isEmpty || sections.isEmpty) return sections;
+
+    final first = sections.first;
+    final firstText = first.content.isNotEmpty ? first.content.first : '';
+    final separator = firstText.isEmpty ? '' : '\n\n';
+    final mergedText = '$prefixText$separator$firstText';
+    final mergedStructuredJson = _mergeStructuredContentJson(
+      prefix.structuredContentJson,
+      prefixText,
+      first.structuredContentJson,
+      firstText,
+      separator.length,
+      mergedText,
+    );
+
+    return [
+      first.copyWith(
+        content: [mergedText],
+        structuredContentJson: mergedStructuredJson,
+      ),
+      ...sections.skip(1),
+    ];
+  }
+
+  String? _mergeStructuredContentJson(
+    String? prefixJson,
+    String prefixText,
+    String? bodyJson,
+    String bodyText,
+    int separatorLength,
+    String mergedText,
+  ) {
+    final blocks = <ContentBlock>[];
+
+    final prefixContent = StructuredContent.tryParse(prefixJson);
+    if (prefixContent != null && prefixContent.isValidFor(prefixText)) {
+      blocks.addAll(prefixContent.annotations);
+    }
+
+    final bodyContent = StructuredContent.tryParse(bodyJson);
+    if (bodyContent != null && bodyContent.isValidFor(bodyText)) {
+      final offset = prefixText.length + separatorLength;
+      blocks.addAll(
+        bodyContent.annotations.map(
+          (block) => _shiftContentBlock(block, offset),
+        ),
+      );
+    }
+
+    if (blocks.isEmpty) {
+      return StructuredContentExtractor().extract(mergedText)?.toJsonString();
+    }
+    return StructuredContent.fromBlocks(mergedText, blocks)?.toJsonString();
+  }
+
+  ContentBlock _shiftContentBlock(ContentBlock block, int offset) {
+    return ContentBlock(
+      type: block.type,
+      start: block.start + offset,
+      end: block.end + offset,
+      level: block.level,
+      caption: block.caption,
+      imagePath: block.imagePath,
+      listMarker: block.listMarker,
+      definitionTermEnd: block.definitionTermEnd == null
+          ? null
+          : block.definitionTermEnd! + offset,
+      tableRows: block.tableRows,
+      preserveLineBreaks: block.preserveLineBreaks,
+      depth: block.depth,
+      marks: [
+        for (final mark in block.marks)
+          InlineMark(
+            type: mark.type,
+            start: mark.start + offset,
+            end: mark.end + offset,
+            url: mark.url,
+            style: mark.style,
+          ),
+      ],
+    );
+  }
+
+  /// Flatten the full TOC tree; preserves pre-order DFS order.
+  List<TocItemFlat> _flattenToc(List<TocEntry> tocEntries) {
+    final flat = <TocItemFlat>[];
+
+    void flatten(TocEntry entry, String? parentTitle) {
+      final isSection = entry.hasChildren;
+      String? firstChildHref;
+      if (isSection && entry.children.isNotEmpty) {
+        firstChildHref = entry.children.first.href;
+      }
+
+      flat.add(
+        TocItemFlat(
+          title: entry.title,
+          href: entry.href,
+          parentTitle: parentTitle,
+          depth: entry.depth,
+          isSection: isSection,
+          firstChildHref: firstChildHref,
+        ),
+      );
+
+      for (final child in entry.children) {
+        flatten(child, entry.title);
+      }
+    }
+
+    for (final entry in tocEntries) {
+      flatten(entry, null);
+    }
+
+    return flat;
+  }
+
+  int? _findFlatParentIndex(List<TocItemFlat> tocFlat, int index) {
+    final depth = tocFlat[index].depth;
+    if (depth <= 0) return null;
+
+    for (var i = index - 1; i >= 0; i--) {
+      if (tocFlat[i].depth < depth) return i;
+    }
+    return null;
+  }
+
+  bool _isHtmlFile(String filename) {
+    final lower = filename.toLowerCase();
+    return lower.endsWith('.html') ||
+        lower.endsWith('.xhtml') ||
+        lower.endsWith('.htm');
+  }
+
+  bool _isDocumentTitleWrapper(
+    TocItemFlat tocItem, {
+    required String? documentTitle,
+    required String? fragment,
+  }) {
+    if (tocItem.depth != 0 || !tocItem.isSection || fragment != null) {
+      return false;
+    }
+    final normalizedDocumentTitle = _normalizeTitle(documentTitle);
+    if (normalizedDocumentTitle.isEmpty) return false;
+    return _normalizeTitle(tocItem.title) == normalizedDocumentTitle;
+  }
+
+  String _normalizeTitle(String? value) {
+    return (value ?? '').trim().replaceAll(RegExp(r'\s+'), ' ').toLowerCase();
+  }
+
+  int _countChapters(List<EpubChapter> chapters) {
+    var count = 0;
+    for (final chapter in chapters) {
+      count++;
+      if (chapter.subChapters.isNotEmpty) {
+        count += _countChapters(chapter.subChapters);
+      }
+    }
+    return count;
+  }
+
+  int _countTree(List<BookSection> sections) {
+    var count = sections.length;
+    for (final s in sections) {
+      count += _countTree(s.subsections);
+    }
+    return count;
+  }
+
+  int _countTocEntries(List<TocEntry> entries) {
+    var count = entries.length;
+    for (final entry in entries) {
+      count += _countTocEntries(entry.children);
+    }
+    return count;
+  }
+}
+
+class _HtmlHeadingCandidate {
+  final String file;
+  final String fragment;
+  final String title;
+  final int level;
+  final int order;
+
+  const _HtmlHeadingCandidate({
+    required this.file,
+    required this.fragment,
+    required this.title,
+    required this.level,
+    required this.order,
+  });
+}
+
+class _HtmlHeadingIndex {
+  final List<_HtmlHeadingCandidate> candidates;
+  final Map<String, int> headingOrderByFragment;
+  final Map<String, int> headingLevelByFragment;
+
+  const _HtmlHeadingIndex({
+    required this.candidates,
+    required this.headingOrderByFragment,
+    required this.headingLevelByFragment,
+  });
+}
+
+class _OriginalTocRange {
+  final String file;
+  final int startOrder;
+  final int endOrder;
+  final int parentHeadingLevel;
+
+  const _OriginalTocRange({
+    required this.file,
+    required this.startOrder,
+    required this.endOrder,
+    required this.parentHeadingLevel,
+  });
+}
