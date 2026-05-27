@@ -8,13 +8,16 @@ import 'package:path/path.dart' as p;
 import 'package:quizpilgrim_book_model/quizpilgrim_book_model.dart';
 import 'package:xml/xml.dart' as xml;
 
+import 'epub_data.dart';
 import 'epub_extraction_result.dart';
 import 'epub_guards.dart';
+import 'epub_html_heading_splitter.dart';
 import 'epub_section_split_options.dart';
 import 'epub_structured_content_builder.dart';
 import 'extracted_text.dart';
 import 'html_text_extractor.dart';
 import 'text_cleaner.dart';
+import 'text_parsing_utils.dart';
 
 const String _loggerName = 'EpubExtractor';
 
@@ -67,8 +70,17 @@ class EpubExtractor {
       onProgress?.call(i + 1, parsed.spine.length, 'Extracting chapters');
     }
 
+    final effectiveSplitOptions =
+        sectionSplitOptions ?? this.sectionSplitOptions;
     onProgress?.call(0, 100, 'Extracting sections');
-    final tocEntries = parsed.readTocEntries();
+    final authoredTocEntries = parsed.readTocEntries();
+    final tocEntries = effectiveSplitOptions.usesHtmlHeadings
+        ? augmentTocWithHtmlHeadings(
+            authoredTocEntries,
+            rawHtmlByHref,
+            effectiveSplitOptions,
+          )
+        : authoredTocEntries;
     final root = _buildSectionTree(
       parsed: parsed,
       tocEntries: tocEntries,
@@ -94,42 +106,22 @@ class EpubExtractor {
     Uint8List epubBytes, {
     String? filename,
   }) async {
-    final result = await extract(
-      epubBytes,
-      filename: filename,
-      sectionSplitOptions: EpubSectionSplitOptions.tocOnly,
+    _logger.fine(
+      'Analyzing EPUB section splits in browser: ${filename ?? "unknown"}',
     );
-    final tocOnlyCount = _countSections(result.root);
-    return EpubSectionSplitAnalysis(
-      tocOnlySectionCount: tocOnlyCount,
-      sectionCountByMaxHtmlHeadingLevel: const {},
-      candidateHeadingCountByLevel: const {},
-    );
-  }
-}
-
-int _countSections(BookSection root) {
-  var count = 0;
-  void walk(BookSection section) {
-    final loc = section.location;
-    if (loc is EpubChapterLocation &&
-        !(loc.spineIndex < 0 && loc.href == null)) {
-      count++;
+    enforceArchiveGuards(epubBytes, guardLimits);
+    final parsed = _ParsedEpub.fromBytes(epubBytes);
+    final rawHtmlByHref = <String, String>{};
+    for (final item in parsed.spine) {
+      rawHtmlByHref[item.href] = parsed.readManifestText(item);
     }
-    for (final child in section.subsections) {
-      walk(child);
-    }
+    return analyzeTocHtmlHeadingSplits(parsed.readTocEntries(), rawHtmlByHref);
   }
-
-  for (final child in root.subsections) {
-    walk(child);
-  }
-  return count;
 }
 
 BookSection _buildSectionTree({
   required _ParsedEpub parsed,
-  required List<_TocEntry> tocEntries,
+  required List<TocEntry> tocEntries,
   required List<EpubChapterContent> chapters,
   required Map<String, String> rawHtmlByHref,
   required bool extractSections,
@@ -156,8 +148,8 @@ BookSection _buildSectionTree({
     );
   }
 
-  final flatEntries = <_TocEntry>[];
-  void collect(_TocEntry entry) {
+  final flatEntries = <TocEntry>[];
+  void collect(TocEntry entry) {
     flatEntries.add(entry);
     for (final child in entry.children) {
       collect(child);
@@ -168,15 +160,21 @@ BookSection _buildSectionTree({
     collect(entry);
   }
 
-  final nextAnchorByEntry = <_TocEntry, String?>{};
+  final nextAnchorByEntry = <TocEntry, String?>{};
   for (var i = 0; i < flatEntries.length; i++) {
     final entry = flatEntries[i];
     final href = entry.href;
     if (href == null) continue;
+    final (file, _) = TextParsingUtils.parseHref(href);
     for (var j = i + 1; j < flatEntries.length; j++) {
       final next = flatEntries[j];
-      if (next.href == href && next.anchor != null) {
-        nextAnchorByEntry[entry] = next.anchor;
+      final nextHref = next.href;
+      if (nextHref == null) continue;
+      final (nextFile, nextAnchor) = TextParsingUtils.parseHref(nextHref);
+      if (nextFile == file && nextAnchor != null) {
+        nextAnchorByEntry[entry] = nextAnchor;
+        break;
+      } else if (nextFile != file) {
         break;
       }
     }
@@ -194,23 +192,26 @@ BookSection _buildSectionTree({
 
 BookSection _buildSection(
   _ParsedEpub parsed,
-  _TocEntry entry,
+  TocEntry entry,
   Map<String, String> rawHtmlByHref,
-  Map<_TocEntry, String?> nextAnchorByEntry,
+  Map<TocEntry, String?> nextAnchorByEntry,
 ) {
   final href = entry.href;
-  final spineIndex = href == null ? -1 : parsed.spineIndexByHref[href] ?? -1;
-  final html = href == null ? null : rawHtmlByHref[href];
+  final (file, anchor) = href == null
+      ? (null, null)
+      : TextParsingUtils.parseHref(href);
+  final spineIndex = file == null ? -1 : parsed.spineIndexByHref[file] ?? -1;
+  final html = file == null ? null : rawHtmlByHref[file];
   final extraction = html == null
       ? null
-      : _extractSection(html, entry.anchor, nextAnchorByEntry[entry]);
+      : _extractSection(html, anchor, nextAnchorByEntry[entry]);
 
   return BookSection(
     title: entry.title,
     location: EpubChapterLocation(
       spineIndex: spineIndex,
-      href: href,
-      anchor: entry.anchor,
+      href: file,
+      anchor: anchor,
     ),
     content: extraction == null ? const [] : [extraction.extracted.text],
     structuredContentJson: extraction == null
@@ -361,7 +362,7 @@ class _ParsedEpub {
     return _decodeFile(file);
   }
 
-  List<_TocEntry> readTocEntries() {
+  List<TocEntry> readTocEntries() {
     final navItem = manifestById.values.cast<_ManifestItem?>().firstWhere(
       (item) =>
           item != null &&
@@ -385,7 +386,7 @@ class _ParsedEpub {
     return const [];
   }
 
-  List<_TocEntry> _readNcxToc(_ManifestItem tocItem) {
+  List<TocEntry> _readNcxToc(_ManifestItem tocItem) {
     final tocFile = filesByPath[tocItem.fullPath];
     if (tocFile == null) return const [];
     final doc = xml.XmlDocument.parse(_decodeFile(tocFile));
@@ -393,30 +394,37 @@ class _ParsedEpub {
     if (navMap == null) return const [];
     return [
       for (final point in _xmlChildrenNamed(navMap, 'navpoint'))
-        _tocEntryFromNcxPoint(point, tocItem),
+        _tocEntryFromNcxPoint(point, tocItem, null, 0),
     ];
   }
 
-  _TocEntry _tocEntryFromNcxPoint(xml.XmlElement point, _ManifestItem tocItem) {
+  TocEntry _tocEntryFromNcxPoint(
+    xml.XmlElement point,
+    _ManifestItem tocItem,
+    String? parentTitle,
+    int depth,
+  ) {
     final label = _textOfFirstXml(
       _firstXmlElementNamed(point, 'navlabel') ?? point,
       'text',
     );
     final content = _firstXmlElementNamed(point, 'content');
     final hrefParts = _resolveTocHref(content?.getAttribute('src'), tocItem);
+    final title = _fallbackTitle(label, hrefParts.href, 0);
     final children = [
       for (final child in _xmlChildrenNamed(point, 'navpoint'))
-        _tocEntryFromNcxPoint(child, tocItem),
+        _tocEntryFromNcxPoint(child, tocItem, title, depth + 1),
     ];
-    return _TocEntry(
+    return TocEntry(
       title: _fallbackTitle(label, hrefParts.href, children.length),
-      href: hrefParts.href,
-      anchor: hrefParts.anchor,
+      href: _joinHref(hrefParts.href, hrefParts.anchor),
+      parentTitle: parentTitle,
+      depth: depth,
       children: children,
     );
   }
 
-  List<_TocEntry> _readNavToc(_ManifestItem navItem) {
+  List<TocEntry> _readNavToc(_ManifestItem navItem) {
     final navFile = filesByPath[navItem.fullPath];
     if (navFile == null) return const [];
     final doc = html_parser.parse(_decodeFile(navFile));
@@ -433,11 +441,16 @@ class _ParsedEpub {
     final list = _firstDirectChildNamed(nav, 'ol') ?? nav;
     return [
       for (final item in _childrenNamed(list, 'li'))
-        _tocEntryFromNavLi(item, navItem),
+        _tocEntryFromNavLi(item, navItem, null, 0),
     ];
   }
 
-  _TocEntry _tocEntryFromNavLi(dom.Element li, _ManifestItem navItem) {
+  TocEntry _tocEntryFromNavLi(
+    dom.Element li,
+    _ManifestItem navItem,
+    String? parentTitle,
+    int depth,
+  ) {
     final labelElement =
         _firstDirectChildNamed(li, 'a') ?? _firstDirectChildNamed(li, 'span');
     final hrefParts = _resolveTocHref(
@@ -445,20 +458,22 @@ class _ParsedEpub {
       navItem,
     );
     final nestedList = _firstDirectChildNamed(li, 'ol');
+    final title = _fallbackTitle(labelElement?.text, hrefParts.href, 0);
     final children = nestedList == null
-        ? const <_TocEntry>[]
+        ? const <TocEntry>[]
         : [
             for (final child in _childrenNamed(nestedList, 'li'))
-              _tocEntryFromNavLi(child, navItem),
+              _tocEntryFromNavLi(child, navItem, title, depth + 1),
           ];
-    return _TocEntry(
+    return TocEntry(
       title: _fallbackTitle(
         labelElement?.text,
         hrefParts.href,
         children.length,
       ),
-      href: hrefParts.href,
-      anchor: hrefParts.anchor,
+      href: _joinHref(hrefParts.href, hrefParts.anchor),
+      parentTitle: parentTitle,
+      depth: depth,
       children: children,
     );
   }
@@ -514,20 +529,6 @@ class _ManifestItem {
   });
 }
 
-class _TocEntry {
-  final String title;
-  final String? href;
-  final String? anchor;
-  final List<_TocEntry> children;
-
-  const _TocEntry({
-    required this.title,
-    required this.href,
-    required this.anchor,
-    required this.children,
-  });
-}
-
 String _decodeFile(ArchiveFile file) {
   return utf8.decode(file.content as List<int>, allowMalformed: true);
 }
@@ -547,6 +548,11 @@ String _safeDecode(String value) {
   } catch (_) {
     return value;
   }
+}
+
+String? _joinHref(String? href, String? anchor) {
+  if (href == null) return null;
+  return anchor == null ? href : '$href#$anchor';
 }
 
 String _fallbackTitle(String? label, String? href, int childCount) {
