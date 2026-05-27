@@ -33,81 +33,9 @@ import 'package:path/path.dart' as p;
 import 'package:quizpilgrim_book_model/quizpilgrim_book_model.dart';
 
 import 'epub_guards.dart';
+import 'epub_image_types.dart';
 
 const String _loggerName = 'EpubImageExtractor';
-
-/// Per-figure result returned by [EpubImageExtractor.extract].
-///
-/// Combines the format-neutral [Figure] (which goes into structured
-/// content) with the absolute filesystem path the bytes were written to
-/// (which the GUI / preview / persistence layers may need to load the
-/// bytes back).
-@immutable
-class ExtractedFigure {
-  /// Format-neutral figure descriptor. `figure.path` is the
-  /// **relative** path supplied by the caller's `namingScheme`; it is
-  /// what gets embedded into structured content for downstream rendering.
-  final Figure figure;
-
-  /// Absolute filesystem path of the written image inside `targetDir`.
-  /// Combine with `figure.path` to reconstruct: `<targetDir>/<figure.path>`.
-  final String absolutePath;
-
-  /// The [BookSection] this figure was attributed to. Determined by
-  /// fragment position in the chapter DOM — see `_attributeOwner`.
-  /// `null` only when the chapter has no [BookSection] referencing it
-  /// (rare; can happen if image extraction is run on a section tree
-  /// that omits some chapters).
-  final BookSection? ownerSection;
-
-  /// Section-local index used by the caller's `namingScheme`.
-  final int sectionLocalIndex;
-
-  const ExtractedFigure({
-    required this.figure,
-    required this.absolutePath,
-    required this.ownerSection,
-    required this.sectionLocalIndex,
-  });
-}
-
-/// Aggregate result of [EpubImageExtractor.extract] — the per-figure
-/// list plus a precomputed map for embedding `imagePath` references
-/// into structured content (anchor → relative path).
-@immutable
-class EpubImageExtractionResult {
-  /// All extracted figures in deterministic chapter-pre-order order.
-  final List<ExtractedFigure> figures;
-
-  /// Anchor → relative path map, where anchor =
-  /// `<chapter_href>:<dom_pre_order_index>`. Used by structured-content
-  /// rewriting; identical to `Figure.anchor → Figure.path` extracted
-  /// from `figures`.
-  final Map<String, String> anchorToPath;
-
-  EpubImageExtractionResult({
-    required this.figures,
-  }) : anchorToPath = Map.unmodifiable({
-          for (final f in figures) f.figure.anchor: f.figure.path,
-        });
-}
-
-/// Naming-scheme callback signature.
-///
-/// Returns the **relative** path (joined under `targetDir`) the image
-/// should be written to. Caller picks the convention; mobile uses
-/// `section_figures/{guid}/{idx}.{ext}`, `book_tools` uses
-/// `figures/{safe_href}/{idx}.{ext}`.
-///
-/// `extension` is the file extension chosen by the extractor (`png`,
-/// `jpg`, `gif`, `webp`, or `svg`) inferred from the source's MIME type
-/// or file extension; the caller MUST honor it so figures aren't
-/// misnamed for their actual byte content.
-typedef EpubFigureNamingScheme = String Function(
-  BookSection section,
-  int sectionLocalIdx,
-  String extension,
-);
 
 /// Public extractor surface.
 class EpubImageExtractor {
@@ -262,10 +190,7 @@ class EpubImageExtractor {
           if (imageRef != null) {
             // Determine owner section (last anchor seen, falling back
             // to the chapter-level first section).
-            final owner = _attributeOwner(
-              sectionsForChapter,
-              anchorPositions,
-            );
+            final owner = _attributeOwner(sectionsForChapter, anchorPositions);
             final localIdx = sectionLocalCounter[owner] ?? 0;
 
             final extracted = _materialize(
@@ -454,7 +379,9 @@ class EpubImageExtractor {
         return null;
       }
       final ext = _extensionFromMime(decoded.mimeType) ?? 'png';
-      final bytes = ext == 'svg' ? _sanitizeSvgBytes(decoded.bytes) : decoded.bytes;
+      final bytes = ext == 'svg'
+          ? _sanitizeSvgBytes(decoded.bytes)
+          : decoded.bytes;
       if (bytes == null) {
         _logger.warning(
           'data: URI in "$chapterHref" at DOM idx $domIndex rejected '
@@ -579,7 +506,8 @@ class EpubImageExtractor {
     // the existing path rather than writing a new file. Each anchor
     // still gets its own Figure entry — N references to one path.
     final cached = dedupBySha[shaHex];
-    final relPath = cached?.relativePath ??
+    final relPath =
+        cached?.relativePath ??
         namingScheme(ownerSection, sectionLocalIdx, ext);
     final fullPath = p.normalize(p.join(targetAbs, relPath));
 
@@ -607,7 +535,10 @@ class EpubImageExtractor {
         );
         return null;
       }
-      dedupBySha[shaHex] = _DedupSlot(relativePath: relPath, absolutePath: fullPath);
+      dedupBySha[shaHex] = _DedupSlot(
+        relativePath: relPath,
+        absolutePath: fullPath,
+      );
     }
 
     final figure = Figure(
@@ -623,6 +554,9 @@ class EpubImageExtractor {
       absolutePath: cached?.absolutePath ?? fullPath,
       ownerSection: ownerSection,
       sectionLocalIndex: sectionLocalIdx,
+      bytes: bytes,
+      mimeType: _mimeFromExtension(ext),
+      sha256: shaHex,
     );
   }
 
@@ -730,6 +664,16 @@ class EpubImageExtractor {
     return null;
   }
 
+  String _mimeFromExtension(String ext) {
+    return switch (ext.toLowerCase()) {
+      'jpg' || 'jpeg' => 'image/jpeg',
+      'gif' => 'image/gif',
+      'webp' => 'image/webp',
+      'svg' => 'image/svg+xml',
+      _ => 'image/png',
+    };
+  }
+
   /// Collect every HTML chapter href in spine order. Walks
   /// `epub_book.chapters` recursively (which mirrors the spine via
   /// `epub_pro.SchemaReader`'s NCX/spine reconciliation) and skips
@@ -773,120 +717,6 @@ class EpubImageExtractor {
     recurse(root);
     return out;
   }
-}
-
-/// Append image blocks for [figures] to [section]'s structured content.
-///
-/// Returns a new [BookSection] with the same identity but updated
-/// `structuredContentJson`. If the section had no structured content,
-/// one is synthesized with only the image blocks (paragraph rendering
-/// of the original `content[0]` is unaffected — the renderer falls
-/// back to plain text in regions the structured content does not
-/// annotate, and image blocks at `start == end == plainText.length`
-/// render after all the section's text).
-///
-/// If [figures] is empty, returns [section] unchanged. If the section
-/// has no plain text (`content` empty), figures are skipped (we cannot
-/// compute a stable `baseTextHash` without text).
-BookSection embedImagePathsInSection(
-  BookSection section,
-  List<ExtractedFigure> figures,
-) {
-  if (figures.isEmpty) return section;
-  if (section.content.isEmpty) return section;
-
-  final plainText = section.content.first;
-  final endOffset = plainText.length;
-
-  final newImageBlocks = <ContentBlock>[
-    for (final f in figures)
-      ContentBlock(
-        type: ContentBlockType.image,
-        start: endOffset,
-        end: endOffset,
-        imagePath: f.figure.path,
-        caption: null,
-      ),
-  ];
-
-  final existing = StructuredContent.tryParse(section.structuredContentJson);
-  final List<ContentBlock> mergedBlocks;
-  final String baseHash;
-  if (existing != null && existing.isValidFor(plainText)) {
-    mergedBlocks = <ContentBlock>[
-      ...existing.annotations,
-      ...newImageBlocks,
-    ];
-    baseHash = existing.baseTextHash;
-  } else {
-    // No usable existing structured content (or it doesn't match the
-    // text the figures were extracted from). Build a fresh
-    // StructuredContent with only the image blocks.
-    mergedBlocks = newImageBlocks;
-    baseHash = StructuredContent.computeHash(plainText);
-  }
-
-  final merged = StructuredContent(
-    schemaVersion: 1,
-    baseTextHash: baseHash,
-    annotations: mergedBlocks,
-  );
-
-  return section.copyWith(
-    structuredContentJson: merged.toJsonString(),
-  );
-}
-
-/// Walk [root] and embed image paths into every section that has
-/// figures attributed to it in [figuresBySection]. Returns a new tree.
-///
-/// `figuresBySection` is typically built by grouping the
-/// [EpubImageExtractionResult.figures] list by `figure.ownerSection`.
-BookSection embedImagePathsInTree(
-  BookSection root,
-  Map<BookSection, List<ExtractedFigure>> figuresBySection,
-) {
-  final figures = figuresBySection[root] ?? const <ExtractedFigure>[];
-  final updatedRoot = embedImagePathsInSection(root, figures);
-
-  if (updatedRoot.subsections.isEmpty) return updatedRoot;
-
-  final updatedChildren = <BookSection>[
-    for (final child in updatedRoot.subsections)
-      embedImagePathsInTree(child, figuresBySection),
-  ];
-
-  // Only allocate a copy if any child actually changed identity.
-  var changed = false;
-  for (var i = 0; i < updatedChildren.length; i++) {
-    if (!identical(updatedChildren[i], updatedRoot.subsections[i])) {
-      changed = true;
-      break;
-    }
-  }
-
-  return changed
-      ? updatedRoot.copyWith(subsections: updatedChildren)
-      : updatedRoot;
-}
-
-/// Group an extraction result's figures by owner section. Sections
-/// with no figures are not included.
-///
-/// Identity-keyed because [BookSection] has structural equality —
-/// using `Map<BookSection, ...>` directly would collide value-equal
-/// sections (e.g. two empty placeholder sections in a malformed TOC),
-/// silently merging their figure lists.
-Map<BookSection, List<ExtractedFigure>> groupFiguresBySection(
-  EpubImageExtractionResult result,
-) {
-  final out = HashMap<BookSection, List<ExtractedFigure>>.identity();
-  for (final f in result.figures) {
-    final owner = f.ownerSection;
-    if (owner == null) continue;
-    out.putIfAbsent(owner, () => <ExtractedFigure>[]).add(f);
-  }
-  return out;
 }
 
 @immutable
