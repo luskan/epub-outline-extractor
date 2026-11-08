@@ -110,6 +110,9 @@ class EpubExtractor {
       title: epubBook.title,
       author: epubBook.author,
       authors: List<String?>.unmodifiable(epubBook.authors),
+      languages: List<String>.unmodifiable(
+        epubBook.schema?.package?.metadata?.languages ?? const <String>[],
+      ),
     );
 
     _logger.fine(

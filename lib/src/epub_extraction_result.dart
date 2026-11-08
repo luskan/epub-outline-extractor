@@ -41,10 +41,14 @@ class EpubBookMetadata {
   /// `null` (epub_pro returns `List&lt;String?&gt;`).
   final List<String?> authors;
 
+  /// Language tags declared by the book's OPF (`dc:language`).
+  final List<String> languages;
+
   const EpubBookMetadata({
     this.title,
     this.author,
     this.authors = const [],
+    this.languages = const [],
   });
 
   @override
@@ -54,10 +58,16 @@ class EpubBookMetadata {
           runtimeType == other.runtimeType &&
           title == other.title &&
           author == other.author &&
-          _listEquals(authors, other.authors);
+          _listEquals(authors, other.authors) &&
+          _listEquals(languages, other.languages);
 
   @override
-  int get hashCode => Object.hash(title, author, Object.hashAll(authors));
+  int get hashCode => Object.hash(
+    title,
+    author,
+    Object.hashAll(authors),
+    Object.hashAll(languages),
+  );
 
   @override
   String toString() =>

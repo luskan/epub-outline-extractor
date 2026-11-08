@@ -17,6 +17,7 @@ void main() {
       );
 
       expect(result.metadata.title, 'Browser EPUB');
+      expect(result.metadata.languages, ['en']);
       expect(result.chapters, hasLength(2));
       expect(result.chapters.first.text, contains('browser importer'));
       expect(result.chapters.last.text, contains('second browser chapter'));

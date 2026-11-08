@@ -15,6 +15,7 @@ void main() {
       final result = await extractor.extract(epubBytes, filename: 'test.epub');
 
       expect(result.metadata.title, 'Test EPUB');
+      expect(result.metadata.languages, ['en']);
       expect(result.root.title, 'Test EPUB');
 
       // Chapters list (page-level view) — one per spine HTML file.

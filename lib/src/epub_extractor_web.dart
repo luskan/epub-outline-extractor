@@ -97,6 +97,7 @@ class EpubExtractor {
         title: parsed.title,
         author: parsed.authors.isEmpty ? null : parsed.authors.join(', '),
         authors: parsed.authors,
+        languages: parsed.languages,
       ),
       rawHtmlByHref: Map.unmodifiable(rawHtmlByHref),
     );
@@ -259,6 +260,7 @@ class _ParsedEpub {
   final String? filenameTitle;
   final String? title;
   final List<String?> authors;
+  final List<String> languages;
   final List<_ManifestItem> spine;
   final Map<String, _ManifestItem> manifestById;
   final Map<String, String> manifestHrefByFullPath;
@@ -271,6 +273,7 @@ class _ParsedEpub {
     required this.filenameTitle,
     required this.title,
     required this.authors,
+    required this.languages,
     required this.spine,
     required this.manifestById,
     required this.manifestHrefByFullPath,
@@ -302,6 +305,10 @@ class _ParsedEpub {
     final opf = xml.XmlDocument.parse(_decodeFile(opfFile));
     final metadata = _firstXmlElementNamed(opf, 'metadata');
     final title = _textOfFirstXml(metadata ?? opf, 'title')?.trim();
+    final languages = [
+      for (final language in _xmlElementsNamed(metadata ?? opf, 'language'))
+        language.innerText.trim(),
+    ].where((value) => value.isNotEmpty).toList(growable: false);
     final authors = [
       for (final creator in _xmlElementsNamed(metadata ?? opf, 'creator'))
         creator.innerText.trim(),
@@ -344,6 +351,7 @@ class _ParsedEpub {
       filenameTitle: null,
       title: title == null || title.isEmpty ? null : title,
       authors: authors,
+      languages: languages,
       spine: spine,
       manifestById: manifestById,
       manifestHrefByFullPath: manifestHrefByFullPath,
